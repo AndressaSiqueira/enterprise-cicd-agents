@@ -1,0 +1,303 @@
+name: CD - Deployment Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      skip_agents:
+        description: 'Skip agent evaluation (for emergencies only)'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: read
+  deployments: write
+  id-token: write  # For OIDC authentication if needed
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    outputs:
+      build_sha: ${{ github.sha }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+          retention-days: 5
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    environment: staging
+    outputs:
+      deployment_status: ${{ steps.deploy.outputs.status }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+
+      - name: Deploy to staging
+        id: deploy
+        run: |
+          echo "🚀 Deploying to staging environment..."
+          echo "SHA: ${{ github.sha }}"
+          echo "Actor: ${{ github.actor }}"
+          echo ""
+          
+          # Simulated deployment steps
+          echo "1. Preparing deployment package..."
+          sleep 1
+          echo "2. Uploading to staging infrastructure..."
+          sleep 1
+          echo "3. Running health checks..."
+          sleep 1
+          echo "4. Deployment complete!"
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Staging smoke tests
+        run: |
+          echo "Running staging smoke tests..."
+          # In a real scenario, this would hit staging endpoints
+          echo "✅ Smoke tests passed"
+
+  run-governance-checks:
+    name: Production Governance Check
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: ${{ inputs.skip_agents != 'true' }}
+    outputs:
+      should_block: ${{ steps.observer.outputs.should_block }}
+      overall_status: ${{ steps.observer.outputs.overall_status }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set GitHub context for agents
+        run: |
+          echo "GITHUB_SHA=${{ github.sha }}" >> $GITHUB_ENV
+          echo "GITHUB_REF=${{ github.ref }}" >> $GITHUB_ENV
+          echo "GITHUB_RUN_ID=${{ github.run_id }}" >> $GITHUB_ENV
+          echo "GITHUB_RUN_NUMBER=${{ github.run_number }}" >> $GITHUB_ENV
+          echo "GITHUB_ACTOR=${{ github.actor }}" >> $GITHUB_ENV
+          echo "GITHUB_EVENT_NAME=${{ github.event_name }}" >> $GITHUB_ENV
+          echo "GITHUB_REPOSITORY=${{ github.repository }}" >> $GITHUB_ENV
+
+      - name: Run IaC Agent
+        run: npx ts-node --esm src/agents/iac-agent/index.ts
+
+      - name: Run CI/CD Agent
+        run: npx ts-node --esm src/agents/cicd-agent/index.ts
+
+      - name: Run Security Agent
+        run: npx ts-node --esm src/agents/security-agent/index.ts
+
+      - name: Run Observer Agent
+        id: observer
+        run: |
+          npx ts-node --esm src/agents/observer-agent/index.ts
+          
+          if [ -f "src/agents/observer-agent/status.json" ]; then
+            SHOULD_BLOCK=$(jq -r '.shouldBlock' src/agents/observer-agent/status.json)
+            OVERALL_STATUS=$(jq -r '.overallStatus' src/agents/observer-agent/status.json)
+            echo "should_block=$SHOULD_BLOCK" >> $GITHUB_OUTPUT
+            echo "overall_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+          else
+            echo "should_block=true" >> $GITHUB_OUTPUT
+            echo "overall_status=fail" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload governance artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-governance
+          path: |
+            src/agents/*/intent.json
+            src/agents/observer-agent/decisions/
+            src/agents/observer-agent/summary.md
+            src/agents/observer-agent/status.json
+            audit.json
+
+      - name: Evaluate governance for production
+        run: |
+          SHOULD_BLOCK="${{ steps.observer.outputs.should_block }}"
+          OVERALL_STATUS="${{ steps.observer.outputs.overall_status }}"
+          
+          echo "Production Governance Status: $OVERALL_STATUS"
+          
+          if [ "$OVERALL_STATUS" = "fail" ]; then
+            echo "::error::Production deployment blocked by governance: DENIED"
+            exit 1
+          fi
+          
+          if [ "$OVERALL_STATUS" = "pending_approval" ]; then
+            echo "::warning::Conditional approval required. Environment protection will handle this."
+          fi
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, run-governance-checks]
+    # This job requires manual approval via GitHub Environment protection rules
+    environment: 
+      name: production
+      url: https://production.example.com
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+
+      - name: Download governance artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: production-governance
+          path: governance/
+
+      - name: Verify governance approval
+        run: |
+          echo "🔐 Production deployment approved"
+          echo "Approver context provided by GitHub Environment"
+          echo ""
+          
+          if [ -f "governance/summary.md" ]; then
+            echo "=== Governance Summary ==="
+            cat governance/summary.md
+            echo ""
+          fi
+
+      - name: Deploy to production
+        id: deploy
+        run: |
+          echo "🚀 Deploying to production environment..."
+          echo "SHA: ${{ github.sha }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo ""
+          
+          # Simulated production deployment
+          echo "1. Creating deployment snapshot..."
+          sleep 1
+          echo "2. Deploying to production cluster..."
+          sleep 2
+          echo "3. Rolling out to all instances..."
+          sleep 1
+          echo "4. Running production health checks..."
+          sleep 1
+          echo "5. Deployment complete!"
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Production smoke tests
+        run: |
+          echo "Running production smoke tests..."
+          # In a real scenario, this would hit production endpoints
+          echo "✅ Production smoke tests passed"
+
+      - name: Create deployment record
+        run: |
+          echo "Creating deployment record..."
+          cat << EOF > deployment-record.json
+          {
+            "sha": "${{ github.sha }}",
+            "environment": "production",
+            "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "actor": "${{ github.actor }}",
+            "run_id": "${{ github.run_id }}",
+            "status": "success"
+          }
+          EOF
+          cat deployment-record.json
+
+      - name: Upload deployment evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-deployment-evidence
+          path: |
+            deployment-record.json
+            governance/
+          retention-days: 90
+
+  notify-deployment:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: always()
+    
+    steps:
+      - name: Notify on success
+        if: needs.deploy-production.result == 'success'
+        run: |
+          echo "✅ Production deployment completed successfully!"
+          echo "SHA: ${{ github.sha }}"
+          echo "Repository: ${{ github.repository }}"
+          # In a real scenario, send to Slack, Teams, etc.
+
+      - name: Notify on failure
+        if: needs.deploy-production.result == 'failure'
+        run: |
+          echo "❌ Production deployment failed!"
+          echo "SHA: ${{ github.sha }}"
+          echo "Check workflow run for details."
+          # In a real scenario, send urgent notification

@@ -1,0 +1,52 @@
+{
+  "name": "enterprise-cicd-agents",
+  "version": "1.0.0",
+  "description": "Enterprise CI/CD simulation with agentic workflows in GitHub Actions",
+  "main": "dist/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --passWithNoTests",
+    "test:ci": "npm test -- --json --outputFile=test-results.json",
+    "lint": "eslint . --ext .ts --max-warnings 0",
+    "lint:fix": "eslint . --ext .ts --fix",
+    "agents:iac": "node --loader ts-node/esm src/agents/iac-agent/index.ts",
+    "agents:cicd": "node --loader ts-node/esm src/agents/cicd-agent/index.ts",
+    "agents:security": "node --loader ts-node/esm src/agents/security-agent/index.ts",
+    "agents:run": "npm run agents:iac && npm run agents:cicd && npm run agents:security",
+    "observer:run": "node --loader ts-node/esm src/agents/observer-agent/index.ts",
+    "ci:local": "npm run build && npm test && npm run lint && npm run agents:run && npm run observer:run",
+    "clean": "rimraf dist coverage test-results.json"
+  },
+  "keywords": [
+    "cicd",
+    "agents",
+    "github-actions",
+    "enterprise",
+    "devops"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0",
+    "rimraf": "^5.0.5",
+    "ts-jest": "^29.1.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/sdk-node": "^0.48.0",
+    "@opentelemetry/sdk-trace-base": "^1.22.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.48.0",
+    "yaml": "^2.3.4"
+  }
+}

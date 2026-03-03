@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Test artifacts
+coverage/
+test-results.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Agent outputs (generated at runtime)
+src/agents/*/intent.json
+src/agents/observer-agent/decisions/
+src/agents/observer-agent/summary.md
+audit.json
+
+# Temp
+tmp/
+temp/

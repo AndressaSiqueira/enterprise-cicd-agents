@@ -1,0 +1,238 @@
+name: CI - Agentic Governance Pipeline
+
+on:
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      skip_agents:
+        description: 'Skip agent evaluation (for debugging)'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  build-and-test:
+    name: Build, Test & Lint
+    runs-on: ubuntu-latest
+    outputs:
+      test_success: ${{ steps.test.outputs.success }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for git diff
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        id: test
+        run: |
+          set +e
+          npm test -- --json --outputFile=test-results.json
+          TEST_EXIT=$?
+          if [ $TEST_EXIT -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+          exit 0  # Don't fail yet, agents will evaluate
+
+      - name: Run lint
+        run: npm run lint || true  # Capture but don't fail
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.json
+          if-no-files-found: ignore
+
+  run-agents:
+    name: Run Governance Agents
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: ${{ inputs.skip_agents != 'true' }}
+    outputs:
+      should_block: ${{ steps.observer.outputs.should_block }}
+      overall_status: ${{ steps.observer.outputs.overall_status }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for git diff
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set GitHub context for agents
+        run: |
+          echo "GITHUB_SHA=${{ github.sha }}" >> $GITHUB_ENV
+          echo "GITHUB_REF=${{ github.ref }}" >> $GITHUB_ENV
+          echo "GITHUB_RUN_ID=${{ github.run_id }}" >> $GITHUB_ENV
+          echo "GITHUB_RUN_NUMBER=${{ github.run_number }}" >> $GITHUB_ENV
+          echo "GITHUB_ACTOR=${{ github.actor }}" >> $GITHUB_ENV
+          echo "GITHUB_EVENT_NAME=${{ github.event_name }}" >> $GITHUB_ENV
+          echo "GITHUB_REPOSITORY=${{ github.repository }}" >> $GITHUB_ENV
+          echo "GITHUB_PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_ENV
+          echo "GITHUB_BASE_SHA=${{ github.event.pull_request.base.sha }}" >> $GITHUB_ENV
+          echo "GITHUB_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
+
+      - name: Run IaC Agent
+        run: npx ts-node --esm src/agents/iac-agent/index.ts
+
+      - name: Run CI/CD Agent
+        run: npx ts-node --esm src/agents/cicd-agent/index.ts
+
+      - name: Run Security Agent
+        run: npx ts-node --esm src/agents/security-agent/index.ts
+
+      - name: Run Observer Agent
+        id: observer
+        run: |
+          npx ts-node --esm src/agents/observer-agent/index.ts
+          
+          # Read status output
+          if [ -f "src/agents/observer-agent/status.json" ]; then
+            SHOULD_BLOCK=$(jq -r '.shouldBlock' src/agents/observer-agent/status.json)
+            OVERALL_STATUS=$(jq -r '.overallStatus' src/agents/observer-agent/status.json)
+            echo "should_block=$SHOULD_BLOCK" >> $GITHUB_OUTPUT
+            echo "overall_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+          else
+            echo "should_block=true" >> $GITHUB_OUTPUT
+            echo "overall_status=fail" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload agent intents
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-intents
+          path: |
+            src/agents/iac-agent/intent.json
+            src/agents/cicd-agent/intent.json
+            src/agents/security-agent/intent.json
+
+      - name: Upload observer decisions
+        uses: actions/upload-artifact@v4
+        with:
+          name: observer-decisions
+          path: |
+            src/agents/observer-agent/decisions/
+            src/agents/observer-agent/summary.md
+            src/agents/observer-agent/status.json
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit
+          path: audit.json
+          if-no-files-found: ignore
+
+  post-pr-comment:
+    name: Post Governance Summary
+    runs-on: ubuntu-latest
+    needs: run-agents
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Download observer decisions
+        uses: actions/download-artifact@v4
+        with:
+          name: observer-decisions
+          path: decisions
+
+      - name: Read summary
+        id: summary
+        run: |
+          if [ -f "decisions/summary.md" ]; then
+            # Escape special characters for GitHub output
+            SUMMARY=$(cat decisions/summary.md)
+            echo "summary<<EOF" >> $GITHUB_OUTPUT
+            echo "$SUMMARY" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "summary=No governance summary available" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post or update PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const summary = `${{ steps.summary.outputs.summary }}`;
+            const marker = '<!-- agent-governance-summary -->';
+            const body = `${marker}\n\n${summary}`;
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(c => c.body.includes(marker));
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  evaluate-governance:
+    name: Evaluate Governance Decisions
+    runs-on: ubuntu-latest
+    needs: run-agents
+    
+    steps:
+      - name: Check governance status
+        run: |
+          SHOULD_BLOCK="${{ needs.run-agents.outputs.should_block }}"
+          OVERALL_STATUS="${{ needs.run-agents.outputs.overall_status }}"
+          
+          echo "Governance Status: $OVERALL_STATUS"
+          echo "Should Block: $SHOULD_BLOCK"
+          
+          if [ "$SHOULD_BLOCK" = "true" ]; then
+            echo "::error::Workflow blocked by governance decision: $OVERALL_STATUS"
+            echo ""
+            echo "One or more agent decisions resulted in DENY or CONDITIONAL status."
+            echo "Review the governance summary in the PR comment or artifacts for details."
+            exit 1
+          fi
+          
+          echo "✅ All governance checks passed"
