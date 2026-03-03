@@ -140,18 +140,18 @@ jobs:
           echo "GITHUB_REPOSITORY=${{ github.repository }}" >> $GITHUB_ENV
 
       - name: Run IaC Agent
-        run: npx ts-node --esm src/agents/iac-agent/index.ts
+        run: npx tsx src/agents/iac-agent/index.ts
 
       - name: Run CI/CD Agent
-        run: npx ts-node --esm src/agents/cicd-agent/index.ts
+        run: npx tsx src/agents/cicd-agent/index.ts
 
       - name: Run Security Agent
-        run: npx ts-node --esm src/agents/security-agent/index.ts
+        run: npx tsx src/agents/security-agent/index.ts
 
       - name: Run Observer Agent
         id: observer
         run: |
-          npx ts-node --esm src/agents/observer-agent/index.ts
+          npx tsx src/agents/observer-agent/index.ts
           
           if [ -f "src/agents/observer-agent/status.json" ]; then
             SHOULD_BLOCK=$(jq -r '.shouldBlock' src/agents/observer-agent/status.json)
