@@ -13,11 +13,11 @@
     "test:ci": "npm test -- --json --outputFile=test-results.json",
     "lint": "eslint . --ext .ts --max-warnings 0",
     "lint:fix": "eslint . --ext .ts --fix",
-    "agents:iac": "node --loader ts-node/esm src/agents/iac-agent/index.ts",
-    "agents:cicd": "node --loader ts-node/esm src/agents/cicd-agent/index.ts",
-    "agents:security": "node --loader ts-node/esm src/agents/security-agent/index.ts",
+    "agents:iac": "npx tsx src/agents/iac-agent/index.ts",
+    "agents:cicd": "npx tsx src/agents/cicd-agent/index.ts",
+    "agents:security": "npx tsx src/agents/security-agent/index.ts",
     "agents:run": "npm run agents:iac && npm run agents:cicd && npm run agents:security",
-    "observer:run": "node --loader ts-node/esm src/agents/observer-agent/index.ts",
+    "observer:run": "npx tsx src/agents/observer-agent/index.ts",
     "ci:local": "npm run build && npm test && npm run lint && npm run agents:run && npm run observer:run",
     "clean": "rimraf dist coverage test-results.json"
   },
@@ -40,6 +40,7 @@
     "rimraf": "^5.0.5",
     "ts-jest": "^29.1.2",
     "ts-node": "^10.9.2",
+    "tsx": "^4.7.0",
     "typescript": "^5.3.3"
   },
   "dependencies": {

@@ -105,18 +105,18 @@ jobs:
           echo "GITHUB_HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
 
       - name: Run IaC Agent
-        run: npx ts-node --esm src/agents/iac-agent/index.ts
+        run: npx tsx src/agents/iac-agent/index.ts
 
       - name: Run CI/CD Agent
-        run: npx ts-node --esm src/agents/cicd-agent/index.ts
+        run: npx tsx src/agents/cicd-agent/index.ts
 
       - name: Run Security Agent
-        run: npx ts-node --esm src/agents/security-agent/index.ts
+        run: npx tsx src/agents/security-agent/index.ts
 
       - name: Run Observer Agent
         id: observer
         run: |
-          npx ts-node --esm src/agents/observer-agent/index.ts
+          npx tsx src/agents/observer-agent/index.ts
           
           # Read status output
           if [ -f "src/agents/observer-agent/status.json" ]; then
