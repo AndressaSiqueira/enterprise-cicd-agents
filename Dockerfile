@@ -52,4 +52,4 @@ ENV NODE_ENV=production
 ENV PORT=3000
 
 # Start the server
-CMD ["node", "dist/server/index.js"]
+CMD ["node", "dist/src/server/index.js"]
