@@ -328,10 +328,96 @@ export const generateDeploymentChecklist = defineTool('generate_deployment_check
   }
 });
 
+/**
+ * Multi-repo dependency analyzer
+ */
+export const analyzeMultiRepoDependencies = defineTool('analyze_multi_repo_dependencies', {
+  description: 'Analyze dependencies between repositories and their health status. Use this to understand impact of changes across multiple services.',
+  parameters: {
+    type: 'object',
+    properties: {
+      repo: {
+        type: 'string',
+        description: 'The repository being evaluated'
+      },
+      action: {
+        type: 'string',
+        enum: ['deploy', 'merge', 'release'],
+        description: 'The action being requested'
+      },
+      dependencies: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'List of dependent repositories'
+      },
+      systemHealthy: {
+        type: 'boolean',
+        description: 'Whether the overall system health is good'
+      },
+      activeAlerts: {
+        type: 'number',
+        description: 'Number of active alerts in monitoring systems'
+      },
+      activeIncidents: {
+        type: 'number',
+        description: 'Number of active P0/P1 incidents'
+      }
+    },
+    required: ['repo', 'action']
+  },
+  handler: async (params: { 
+    repo: string; 
+    action: string; 
+    dependencies?: string[];
+    systemHealthy?: boolean;
+    activeAlerts?: number;
+    activeIncidents?: number;
+  }) => {
+    const risks: string[] = [];
+    let recommendation: 'APPROVE' | 'REVIEW' | 'BLOCK' = 'APPROVE';
+
+    // Check incidents
+    if (params.activeIncidents && params.activeIncidents > 0) {
+      risks.push(`${params.activeIncidents} active incident(s) - changes may complicate troubleshooting`);
+      recommendation = 'BLOCK';
+    }
+
+    // Check alerts
+    if (params.activeAlerts && params.activeAlerts > 5) {
+      risks.push(`${params.activeAlerts} active alerts indicate system instability`);
+      recommendation = recommendation === 'BLOCK' ? 'BLOCK' : 'REVIEW';
+    }
+
+    // Check system health
+    if (params.systemHealthy === false) {
+      risks.push('System health checks failing');
+      recommendation = 'BLOCK';
+    }
+
+    // Check dependencies
+    if (params.dependencies && params.dependencies.length > 0) {
+      risks.push(`This repo has ${params.dependencies.length} dependencies that should be healthy before ${params.action}`);
+    }
+
+    return {
+      repo: params.repo,
+      action: params.action,
+      recommendation,
+      risks,
+      guidance: recommendation === 'APPROVE' 
+        ? `Safe to proceed with ${params.action}`
+        : recommendation === 'REVIEW'
+          ? `Proceed with caution - consider the identified risks`
+          : `Do not proceed - resolve blocking issues first`
+    };
+  }
+});
+
 // Export all tools as an array for use in createSession
 export const governanceTools = [
   checkPolicyCompliance,
   assessSecurityRisk,
   evaluateTestCoverage,
-  generateDeploymentChecklist
+  generateDeploymentChecklist,
+  analyzeMultiRepoDependencies
 ];

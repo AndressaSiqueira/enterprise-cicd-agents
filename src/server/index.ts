@@ -12,6 +12,7 @@ import { trace, SpanStatusCode } from '@opentelemetry/api';
 import { initTelemetry } from '../shared/telemetry.js';
 import { governanceTools } from './tools.js';
 import { systemPrompt } from './prompts.js';
+import { DependencyService } from '../integrations/dependency-service.js';
 
 // Initialize telemetry
 initTelemetry('governance-api');
@@ -415,6 +416,76 @@ Provide a clear APPROVE or DENY decision with justification.
   });
 });
 
+// Multi-repo governance check endpoint
+app.post('/api/governance/multi-repo-check', async (req: Request, res: Response, next: NextFunction) => {
+  const tracer = trace.getTracer('governance-api');
+  
+  await tracer.startActiveSpan('multi-repo-check', async (span) => {
+    try {
+      const { owner, repo, action } = req.body;
+
+      if (!owner || !repo || !action) {
+        res.status(400).json({ error: 'owner, repo, and action are required' });
+        span.end();
+        return;
+      }
+
+      if (!['deploy', 'merge', 'release'].includes(action)) {
+        res.status(400).json({ error: 'action must be one of: deploy, merge, release' });
+        span.end();
+        return;
+      }
+
+      if (!GITHUB_TOKEN) {
+        res.status(500).json({ error: 'GITHUB_TOKEN not configured' });
+        span.end();
+        return;
+      }
+
+      span.setAttribute('repo', `${owner}/${repo}`);
+      span.setAttribute('action', action);
+
+      // Initialize dependency service and check multi-repo status
+      const dependencyService = new DependencyService(GITHUB_TOKEN);
+      const checkResult = await dependencyService.checkMultiRepo(owner, repo, action);
+
+      // Generate summary for AI analysis
+      const aiPrompt = dependencyService.generateSummaryForAI(checkResult);
+
+      // Get AI analysis using Copilot SDK
+      const client = await getCopilotClient();
+      const session = await client.createSession({
+        model: 'gpt-5',
+        tools: governanceTools,
+        systemMessage: {
+          content: systemPrompt
+        },
+        onPermissionRequest: approveAll
+      });
+
+      const response = await session.sendAndWait({ prompt: aiPrompt });
+      const aiAnalysis = response?.data?.content || '';
+
+      const result = {
+        ...checkResult,
+        aiAnalysis
+      };
+
+      await session.destroy();
+      span.setAttribute('decision', result.decision);
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+
+      res.json(result);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      span.setStatus({ code: SpanStatusCode.ERROR, message: errorMessage });
+      span.end();
+      next(error);
+    }
+  });
+});
+
 // Error handler
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error('API Error:', err);
@@ -444,6 +515,7 @@ app.listen(PORT, () => {
   console.log(`   POST /api/governance/analyze-pr - PR analysis`);
   console.log(`   POST /api/governance/security-scan - Security scanning`);
   console.log(`   POST /api/governance/deployment-decision - Deployment approval`);
+  console.log(`   POST /api/governance/multi-repo-check - Multi-repo governance`);
   console.log(`   GET  /health - Health check`);
 });
 
