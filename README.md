@@ -357,17 +357,17 @@ For detailed RAI documentation, see [docs/rai.md](docs/rai.md).
 
 ## 🧪 Testing Locally
 
-### Run the full governance pipeline locally:
+### Run the server and test:
 
 ```bash
-# Run all agents
-npm run agents:run
-
-# Run observer to evaluate
-npm run observer:run
-
-# Or run the complete CI simulation
+# Build and test
 npm run ci:local
+
+# Start the server
+npm run dev
+
+# Test health endpoint
+curl http://localhost:3000/health
 ```
 
 ### Test with a real PR:

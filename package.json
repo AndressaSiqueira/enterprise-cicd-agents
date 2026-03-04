@@ -15,13 +15,8 @@
     "test:ci": "npm test -- --json --outputFile=test-results.json",
     "lint": "eslint . --ext .ts --max-warnings 0",
     "lint:fix": "eslint . --ext .ts --fix",
-    "agents:iac": "npx tsx src/agents/iac-agent/index.ts",
-    "agents:cicd": "npx tsx src/agents/cicd-agent/index.ts",
-    "agents:security": "npx tsx src/agents/security-agent/index.ts",
-    "agents:run": "npm run agents:iac && npm run agents:cicd && npm run agents:security",
-    "observer:run": "npx tsx src/agents/observer-agent/index.ts",
     "mcp:start": "npx tsx src/mcp/server.ts",
-    "ci:local": "npm run build && npm test && npm run lint && npm run agents:run && npm run observer:run",
+    "ci:local": "npm run build && npm test && npm run lint",
     "clean": "rimraf dist coverage test-results.json"
   },
   "keywords": [

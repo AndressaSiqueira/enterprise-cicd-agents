@@ -1,4 +1,4 @@
-name: CD - Deployment Pipeline
+name: CD - Deploy Governance SDK Server
 
 on:
   push:
@@ -13,20 +13,14 @@ on:
         options:
           - staging
           - production
-      skip_agents:
-        description: 'Skip agent evaluation (for emergencies only)'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
   deployments: write
-  id-token: write  # For OIDC authentication with Azure
+  id-token: write
 
 env:
   NODE_VERSION: '20'
-  # Azure Configuration - Set these as repository secrets/variables
   AZURE_RESOURCE_GROUP: rg-cicd-governance
   AZURE_LOCATION: eastus
   ACR_NAME: acrcicdgovernance
@@ -36,7 +30,7 @@ env:
 
 jobs:
   # ============================================
-  # STEP 1: Provision Infrastructure (if needed)
+  # Provision Infrastructure (if needed)
   # ============================================
   provision-infrastructure:
     name: Provision Azure Infrastructure
@@ -60,9 +54,7 @@ jobs:
         run: |
           echo "🔧 Checking and provisioning Azure infrastructure..."
           
-          # ============================================
-          # 1. Resource Group
-          # ============================================
+          # Resource Group
           RG_EXISTS=$(az group exists --name ${{ env.AZURE_RESOURCE_GROUP }})
           if [ "$RG_EXISTS" = "false" ]; then
             echo "📦 Creating Resource Group..."
@@ -73,9 +65,7 @@ jobs:
             echo "✅ Resource Group exists"
           fi
           
-          # ============================================
-          # 2. Container Registry
-          # ============================================
+          # Container Registry
           ACR_EXISTS=$(az acr show --name ${{ env.ACR_NAME }} --query "name" -o tsv 2>/dev/null || echo "")
           if [ -z "$ACR_EXISTS" ]; then
             echo "📦 Creating Container Registry..."
@@ -88,20 +78,12 @@ jobs:
             echo "✅ Container Registry exists"
           fi
           
-          # Get ACR login server and ID
           ACR_LOGIN_SERVER=$(az acr show --name ${{ env.ACR_NAME }} --query "loginServer" -o tsv)
           ACR_ID=$(az acr show --name ${{ env.ACR_NAME }} --query "id" -o tsv)
           echo "acr_login_server=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
-          echo "acr_id=$ACR_ID" >> $GITHUB_OUTPUT
           
-          # ============================================
-          # 3. Grant AcrPush to Pipeline Service Principal
-          # This allows the CD pipeline to push images to ACR
-          # ============================================
-          echo "🔐 Ensuring AcrPush permission for pipeline..."
+          # Grant AcrPush to Pipeline Service Principal
           SP_APP_ID="${{ secrets.AZURE_CLIENT_ID }}"
-          
-          # Check if assignment exists
           ACRPUSH_EXISTS=$(az role assignment list \
             --assignee "$SP_APP_ID" \
             --role "AcrPush" \
@@ -109,18 +91,13 @@ jobs:
             --query "[0].id" -o tsv 2>/dev/null || echo "")
           
           if [ -z "$ACRPUSH_EXISTS" ]; then
-            echo "📦 Granting AcrPush to pipeline Service Principal..."
             az role assignment create \
               --assignee "$SP_APP_ID" \
               --role "AcrPush" \
-              --scope "$ACR_ID" || echo "⚠️ AcrPush assignment may already exist or require propagation"
-          else
-            echo "✅ AcrPush permission exists"
+              --scope "$ACR_ID" || true
           fi
           
-          # ============================================
-          # 4. Container Apps Environment
-          # ============================================
+          # Container Apps Environment
           CAE_EXISTS=$(az containerapp env show --name ${{ env.CONTAINER_APP_ENV }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --query "name" -o tsv 2>/dev/null || echo "")
           if [ -z "$CAE_EXISTS" ]; then
             echo "📦 Creating Container Apps Environment..."
@@ -132,27 +109,19 @@ jobs:
             echo "✅ Container Apps Environment exists"
           fi
           
-          echo ""
-          echo "✅ Infrastructure provisioning complete!"
-          echo "   ACR: $ACR_LOGIN_SERVER"
-          echo "   Environment: ${{ env.CONTAINER_APP_ENV }}"
+          echo "✅ Infrastructure ready"
 
   # ============================================
-  # STEP 2: Build Application
+  # Build and Push Docker Image
   # ============================================
   build:
-    name: Build Application
+    name: Build & Push Image
     runs-on: ubuntu-latest
     needs: provision-infrastructure
-    outputs:
-      build_sha: ${{ github.sha }}
-      image_tag: ${{ steps.meta.outputs.tags }}
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -176,9 +145,8 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Login to Azure Container Registry
-        run: |
-          az acr login --name ${{ env.ACR_NAME }}
+      - name: Login to ACR
+        run: az acr login --name ${{ env.ACR_NAME }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -187,7 +155,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.ACR_NAME }}.azurecr.io/governance-api
+          images: ${{ env.ACR_NAME }}.azurecr.io/governance-sdk
           tags: |
             type=sha,prefix=
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
@@ -202,26 +170,18 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-output
-          path: dist/
-          retention-days: 5
-
+  # ============================================
+  # Deploy to Staging
+  # ============================================
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
     needs: build
     environment: staging
     outputs:
-      deployment_status: ${{ steps.deploy.outputs.status }}
-      staging_url: ${{ steps.deploy.outputs.url }}
+      url: ${{ steps.deploy.outputs.url }}
     
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Azure Login
         uses: azure/login@v2
         with:
@@ -229,29 +189,19 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to Azure Container Apps (Staging)
+      - name: Deploy to Container Apps (Staging)
         id: deploy
         run: |
-          echo "🚀 Deploying to staging environment..."
-          
-          # Use short SHA for image tag (matches docker/metadata-action output)
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-api:${SHORT_SHA}"
-          
-          # Get ACR resource ID for role assignments
+          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-sdk:${SHORT_SHA}"
           ACR_ID=$(az acr show --name ${{ env.ACR_NAME }} --query "id" -o tsv)
           
-          # Check if Container App exists
           APP_EXISTS=$(az containerapp show \
             --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
             --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
             --query "name" -o tsv 2>/dev/null || echo "")
           
           if [ -z "$APP_EXISTS" ]; then
-            echo "📦 Creating new Container App with system-assigned managed identity..."
-            
-            # Create Container App with a placeholder image first to get managed identity
-            # Using mcr.microsoft.com/k8se/quickstart as it's always available
             az containerapp create \
               --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -262,251 +212,61 @@ jobs:
               --min-replicas 1 \
               --max-replicas 3 \
               --system-assigned \
-              --env-vars "NODE_ENV=staging"
+              --env-vars "NODE_ENV=staging" "GITHUB_TOKEN=secretref:github-token"
             
-            # Get the managed identity principal ID
-            echo "🔐 Configuring ACR access for Container App managed identity..."
             IDENTITY_PRINCIPAL_ID=$(az containerapp show \
               --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --query "identity.principalId" -o tsv)
             
-            echo "   Identity Principal ID: $IDENTITY_PRINCIPAL_ID"
-            
-            # Grant AcrPull role to the Container App's managed identity
-            echo "📦 Granting AcrPull permission..."
             az role assignment create \
               --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
               --assignee-principal-type "ServicePrincipal" \
               --role "AcrPull" \
               --scope "$ACR_ID"
             
-            # Wait for role assignment to propagate
-            echo "⏳ Waiting for role assignment to propagate (30s)..."
             sleep 30
             
-            # Configure registry with managed identity FIRST (before pulling image)
-            echo "📦 Configuring ACR registry with managed identity..."
             az containerapp registry set \
               --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --server "${{ env.ACR_NAME }}.azurecr.io" \
               --identity system
-            
-            # Now update with the actual image from ACR
-            echo "📦 Updating Container App with application image..."
-            az containerapp update \
-              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --image "$IMAGE" \
-              --set-env-vars "NODE_ENV=staging" "BUILD_SHA=${{ github.sha }}"
-          else
-            echo "📦 Updating existing Container App..."
-            
-            # Ensure managed identity is enabled
-            IDENTITY_PRINCIPAL_ID=$(az containerapp show \
-              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --query "identity.principalId" -o tsv)
-            
-            if [ -z "$IDENTITY_PRINCIPAL_ID" ] || [ "$IDENTITY_PRINCIPAL_ID" = "null" ]; then
-              echo "🔐 Enabling system-assigned managed identity..."
-              az containerapp identity assign \
-                --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
-                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-                --system-assigned
-              
-              IDENTITY_PRINCIPAL_ID=$(az containerapp show \
-                --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
-                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-                --query "identity.principalId" -o tsv)
-            fi
-            
-            echo "   Identity Principal ID: $IDENTITY_PRINCIPAL_ID"
-            
-            # Ensure AcrPull role is assigned
-            EXISTING_ROLE=$(az role assignment list \
-              --assignee "$IDENTITY_PRINCIPAL_ID" \
-              --role "AcrPull" \
-              --scope "$ACR_ID" \
-              --query "[0].id" -o tsv 2>/dev/null || echo "")
-            
-            if [ -z "$EXISTING_ROLE" ]; then
-              echo "📦 Granting AcrPull permission..."
-              az role assignment create \
-                --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
-                --assignee-principal-type "ServicePrincipal" \
-                --role "AcrPull" \
-                --scope "$ACR_ID"
-              
-              echo "⏳ Waiting for role assignment to propagate (30s)..."
-              sleep 30
-            else
-              echo "✅ AcrPull permission already exists"
-            fi
-            
-            # Ensure registry is configured with managed identity
-            az containerapp registry set \
-              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --server "${{ env.ACR_NAME }}.azurecr.io" \
-              --identity system
-            
-            # Now update with the new image
-            az containerapp update \
-              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --image "$IMAGE" \
-              --set-env-vars "BUILD_SHA=${{ github.sha }}"
           fi
           
-          # Get the URL
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --image "$IMAGE" \
+            --set-env-vars "BUILD_SHA=${{ github.sha }}"
+          
           URL=$(az containerapp show \
             --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
             --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
             --query "properties.configuration.ingress.fqdn" -o tsv)
           
-          echo "status=success" >> $GITHUB_OUTPUT
           echo "url=https://$URL" >> $GITHUB_OUTPUT
-          echo ""
-          echo "✅ Deployed to: https://$URL"
+          echo "✅ Staging deployed: https://$URL"
 
-      - name: Staging smoke tests
+      - name: Health check
         run: |
-          echo "Running staging smoke tests..."
-          URL="${{ steps.deploy.outputs.url }}"
-          
-          # Wait for app to be ready
           sleep 10
-          
-          # Health check
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo "000")
-          
-          if [ "$HTTP_STATUS" = "200" ]; then
-            echo "✅ Health check passed (HTTP $HTTP_STATUS)"
-          else
-            echo "⚠️ Health check returned HTTP $HTTP_STATUS (may still be starting)"
-          fi
+          curl -f "${{ steps.deploy.outputs.url }}/health" || echo "Health check pending"
 
-  run-governance-checks:
-    name: Production Governance Check
-    runs-on: ubuntu-latest
-    needs: deploy-staging
-    if: ${{ inputs.skip_agents != 'true' }}
-    outputs:
-      should_block: ${{ steps.observer.outputs.should_block }}
-      overall_status: ${{ steps.observer.outputs.overall_status }}
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Set GitHub context for agents
-        run: |
-          echo "GITHUB_SHA=${{ github.sha }}" >> $GITHUB_ENV
-          echo "GITHUB_REF=${{ github.ref }}" >> $GITHUB_ENV
-          echo "GITHUB_RUN_ID=${{ github.run_id }}" >> $GITHUB_ENV
-          echo "GITHUB_RUN_NUMBER=${{ github.run_number }}" >> $GITHUB_ENV
-          echo "GITHUB_ACTOR=${{ github.actor }}" >> $GITHUB_ENV
-          echo "GITHUB_EVENT_NAME=${{ github.event_name }}" >> $GITHUB_ENV
-          echo "GITHUB_REPOSITORY=${{ github.repository }}" >> $GITHUB_ENV
-
-      - name: Run IaC Agent
-        run: npx tsx src/agents/iac-agent/index.ts
-
-      - name: Run CI/CD Agent
-        run: npx tsx src/agents/cicd-agent/index.ts
-
-      - name: Run Security Agent
-        run: npx tsx src/agents/security-agent/index.ts
-
-      - name: Run Observer Agent
-        id: observer
-        run: |
-          npx tsx src/agents/observer-agent/index.ts
-          
-          if [ -f "src/agents/observer-agent/status.json" ]; then
-            SHOULD_BLOCK=$(jq -r '.shouldBlock' src/agents/observer-agent/status.json)
-            OVERALL_STATUS=$(jq -r '.overallStatus' src/agents/observer-agent/status.json)
-            echo "should_block=$SHOULD_BLOCK" >> $GITHUB_OUTPUT
-            echo "overall_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
-          else
-            echo "should_block=true" >> $GITHUB_OUTPUT
-            echo "overall_status=fail" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload governance artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: production-governance
-          path: |
-            src/agents/*/intent.json
-            src/agents/observer-agent/decisions/
-            src/agents/observer-agent/summary.md
-            src/agents/observer-agent/status.json
-            audit.json
-
-      - name: Evaluate governance for production
-        run: |
-          SHOULD_BLOCK="${{ steps.observer.outputs.should_block }}"
-          OVERALL_STATUS="${{ steps.observer.outputs.overall_status }}"
-          
-          echo "Production Governance Status: $OVERALL_STATUS"
-          
-          if [ "$OVERALL_STATUS" = "fail" ]; then
-            echo "::error::Production deployment blocked by governance: DENIED"
-            exit 1
-          fi
-          
-          if [ "$OVERALL_STATUS" = "pending_approval" ]; then
-            echo "::warning::Conditional approval required. Environment protection will handle this."
-          fi
-
+  # ============================================
+  # Deploy to Production (requires approval)
+  # ============================================
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: [deploy-staging, run-governance-checks]
-    # This job requires manual approval via GitHub Environment protection rules
+    needs: deploy-staging
     environment: 
       name: production
       url: ${{ steps.deploy.outputs.url }}
     outputs:
       url: ${{ steps.deploy.outputs.url }}
-      status: ${{ steps.deploy.outputs.status }}
     
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download governance artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: production-governance
-          path: governance/
-
-      - name: Verify governance approval
-        run: |
-          echo "🔐 Production deployment approved"
-          echo "Approver context provided by GitHub Environment"
-          echo ""
-          
-          if [ -f "governance/summary.md" ]; then
-            echo "=== Governance Summary ==="
-            cat governance/summary.md
-            echo ""
-          fi
-
       - name: Azure Login
         uses: azure/login@v2
         with:
@@ -514,34 +274,19 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to Azure Container Apps (Production)
+      - name: Deploy to Container Apps (Production)
         id: deploy
         run: |
-          echo "🚀 Deploying to production environment..."
-          echo "SHA: ${{ github.sha }}"
-          echo "Actor: ${{ github.actor }}"
-          echo "Run ID: ${{ github.run_id }}"
-          echo ""
-          
-          # Get the image tag (same as staging, already tested)
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-api:${SHORT_SHA}"
+          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-sdk:${SHORT_SHA}"
+          ACR_ID=$(az acr show --name ${{ env.ACR_NAME }} --query "id" -o tsv)
           
-          # Get ACR ID for role assignment
-          ACR_ID=$(az acr show \
-            --name ${{ env.ACR_NAME }} \
-            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --query "id" -o tsv)
-          
-          # Check if Container App exists
           APP_EXISTS=$(az containerapp show \
             --name ${{ env.CONTAINER_APP_NAME_PROD }} \
             --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
             --query "name" -o tsv 2>/dev/null || echo "")
           
           if [ -z "$APP_EXISTS" ]; then
-            echo "Creating new Container App with placeholder image..."
-            # Create with placeholder first to get managed identity
             az containerapp create \
               --name ${{ env.CONTAINER_APP_NAME_PROD }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -551,191 +296,53 @@ jobs:
               --ingress external \
               --min-replicas 2 \
               --max-replicas 10 \
-              --env-vars "NODE_ENV=production" \
               --cpu 1.0 \
               --memory 2.0Gi \
-              --system-assigned
+              --system-assigned \
+              --env-vars "NODE_ENV=production" "GITHUB_TOKEN=secretref:github-token"
             
-            # Get the managed identity principal ID
-            echo "Getting managed identity principal ID..."
-            IDENTITY_PRINCIPAL_ID=$(az containerapp show \
-              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --query "identity.principalId" -o tsv)
-            echo "Managed Identity Principal ID: $IDENTITY_PRINCIPAL_ID"
-            
-            # Grant AcrPull role to the managed identity
-            echo "Granting AcrPull role to managed identity..."
-            EXISTING_ROLE=$(az role assignment list \
-              --assignee "$IDENTITY_PRINCIPAL_ID" \
-              --role "AcrPull" \
-              --scope "$ACR_ID" \
-              --query "[0].id" -o tsv 2>/dev/null || echo "")
-            
-            if [ -z "$EXISTING_ROLE" ]; then
-              az role assignment create \
-                --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
-                --assignee-principal-type ServicePrincipal \
-                --role "AcrPull" \
-                --scope "$ACR_ID"
-              echo "✅ AcrPull role granted to managed identity"
-              
-              # Wait for role propagation
-              echo "Waiting 30 seconds for role propagation..."
-              sleep 30
-            else
-              echo "✅ AcrPull role already exists"
-            fi
-            
-            # Configure registry with managed identity FIRST (before pulling image)
-            echo "📦 Configuring ACR registry with managed identity..."
-            az containerapp registry set \
-              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --server ${{ env.ACR_NAME }}.azurecr.io \
-              --identity system
-            
-            # Now update with the actual image from ACR
-            echo "Updating Container App with actual image..."
-            az containerapp update \
-              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --image $IMAGE
-          else
-            echo "Updating existing Container App..."
-            
-            # Ensure managed identity is enabled
             IDENTITY_PRINCIPAL_ID=$(az containerapp show \
               --name ${{ env.CONTAINER_APP_NAME_PROD }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --query "identity.principalId" -o tsv)
             
-            if [ -z "$IDENTITY_PRINCIPAL_ID" ] || [ "$IDENTITY_PRINCIPAL_ID" = "null" ]; then
-              echo "🔐 Enabling system-assigned managed identity..."
-              az containerapp identity assign \
-                --name ${{ env.CONTAINER_APP_NAME_PROD }} \
-                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-                --system-assigned
-              
-              IDENTITY_PRINCIPAL_ID=$(az containerapp show \
-                --name ${{ env.CONTAINER_APP_NAME_PROD }} \
-                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-                --query "identity.principalId" -o tsv)
-            fi
-            
-            echo "   Identity Principal ID: $IDENTITY_PRINCIPAL_ID"
-            
-            # Ensure AcrPull role is assigned
-            EXISTING_ROLE=$(az role assignment list \
-              --assignee "$IDENTITY_PRINCIPAL_ID" \
+            az role assignment create \
+              --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
+              --assignee-principal-type "ServicePrincipal" \
               --role "AcrPull" \
-              --scope "$ACR_ID" \
-              --query "[0].id" -o tsv 2>/dev/null || echo "")
+              --scope "$ACR_ID"
             
-            if [ -z "$EXISTING_ROLE" ]; then
-              echo "📦 Granting AcrPull permission..."
-              az role assignment create \
-                --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
-                --assignee-principal-type "ServicePrincipal" \
-                --role "AcrPull" \
-                --scope "$ACR_ID"
-              
-              echo "⏳ Waiting for role assignment to propagate (30s)..."
-              sleep 30
-            else
-              echo "✅ AcrPull permission already exists"
-            fi
+            sleep 30
             
-            # Ensure registry is configured with managed identity
             az containerapp registry set \
               --name ${{ env.CONTAINER_APP_NAME_PROD }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --server ${{ env.ACR_NAME }}.azurecr.io \
+              --server "${{ env.ACR_NAME }}.azurecr.io" \
               --identity system
-            
-            # Now update with the new image
-            az containerapp update \
-              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --image $IMAGE
           fi
           
-          # Get the URL
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --image "$IMAGE" \
+            --set-env-vars "BUILD_SHA=${{ github.sha }}"
+          
           URL=$(az containerapp show \
             --name ${{ env.CONTAINER_APP_NAME_PROD }} \
             --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
             --query "properties.configuration.ingress.fqdn" -o tsv)
           
-          echo "status=success" >> $GITHUB_OUTPUT
           echo "url=https://$URL" >> $GITHUB_OUTPUT
-          echo "✅ Deployed to: https://$URL"
+          echo "✅ Production deployed: https://$URL"
 
-      - name: Production smoke tests
+      - name: Health check
         run: |
-          echo "Running production smoke tests..."
-          URL="${{ steps.deploy.outputs.url }}"
-          
-          # Wait for app to be ready
           sleep 15
-          
-          # Health check with retries
           for i in 1 2 3; do
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo "000")
-            if [ "$HTTP_STATUS" = "200" ]; then
-              echo "✅ Health check passed (HTTP $HTTP_STATUS)"
-              break
+            if curl -f "${{ steps.deploy.outputs.url }}/health"; then
+              echo "✅ Health check passed"
+              exit 0
             fi
-            echo "Attempt $i: HTTP $HTTP_STATUS, retrying..."
             sleep 5
           done
-          
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "⚠️ Health check did not return 200, but deployment may still be in progress"
-          fi
-
-      - name: Create deployment record
-        run: |
-          echo "Creating deployment record..."
-          cat << EOF > deployment-record.json
-          {
-            "sha": "${{ github.sha }}",
-            "environment": "production",
-            "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "actor": "${{ github.actor }}",
-            "run_id": "${{ github.run_id }}",
-            "url": "${{ steps.deploy.outputs.url }}",
-            "status": "success"
-          }
-          EOF
-          cat deployment-record.json
-
-      - name: Upload deployment evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: production-deployment-evidence
-          path: |
-            deployment-record.json
-            governance/
-          retention-days: 90
-
-  notify-deployment:
-    name: Deployment Notification
-    runs-on: ubuntu-latest
-    needs: deploy-production
-    if: always()
-    
-    steps:
-      - name: Notify on success
-        if: needs.deploy-production.result == 'success'
-        run: |
-          echo "✅ Production deployment completed successfully!"
-          echo "SHA: ${{ github.sha }}"
-          echo "Repository: ${{ github.repository }}"
-          echo "URL: ${{ needs.deploy-production.outputs.url }}"
-
-      - name: Notify on failure
-        if: needs.deploy-production.result == 'failure'
-        run: |
-          echo "❌ Production deployment failed!"
-          echo "SHA: ${{ github.sha }}"
-          echo "Check workflow run for details."
+          echo "⚠️ Health check pending"

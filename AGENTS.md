@@ -1,87 +1,135 @@
-# AGENTS.md - Enterprise CI/CD Governance Agent Instructions
+# AGENTS.md - Enterprise CI/CD Governance SDK
 
-This file provides custom instructions for AI agents working with this codebase.
+This file provides instructions for AI agents working with this codebase.
 
 ## Project Overview
 
-This is an **Enterprise CI/CD Governance** application powered by the **GitHub Copilot SDK**. It provides AI-driven governance decisions for pull requests, security scanning, and deployment approvals.
+This is an **Enterprise CI/CD Governance Server** powered by the **GitHub Copilot SDK**. It provides AI-driven governance decisions for pull requests, security scanning, and deployment approvals.
+
+**Key Point**: This is a **service** that other repositories consume, not a self-contained CI/CD pipeline.
 
 ## Architecture
 
 ```
 enterprise-cicd-agents/
 ├── src/
-│   ├── server/           # Express API server with Copilot SDK integration
+│   ├── server/           # Express API server with Copilot SDK
 │   │   ├── index.ts      # Main server with governance endpoints
 │   │   ├── tools.ts      # Copilot SDK tool definitions
 │   │   └── prompts.ts    # System prompts for AI behavior
 │   ├── mcp/              # Model Context Protocol server
-│   │   └── server.ts     # MCP server exposing governance tools
-│   ├── agents/           # Legacy rule-based agents (for CI integration)
-│   │   ├── iac-agent/    # Infrastructure change detection
-│   │   ├── cicd-agent/   # Test result analysis
-│   │   ├── security-agent/  # npm audit wrapper
-│   │   └── observer-agent/  # Policy evaluation
+│   │   └── server.ts     # MCP server for Copilot Chat integration
 │   └── shared/           # Shared utilities
 │       ├── types.ts      # TypeScript type definitions
 │       ├── telemetry.ts  # OpenTelemetry instrumentation
 │       └── index.ts      # Shared exports
-├── app/                  # Sample application (for demo)
-├── infra/                # Sample IaC files (staging/prod)
+├── examples/             # Integration examples for other repos
+├── infra/                # Infrastructure as Code (Bicep/Terraform)
 ├── policies/             # Policy-as-code YAML files
-├── .github/workflows/    # GitHub Actions CI/CD workflows
+├── .github/workflows/    # CI/CD for this server
 └── docs/                 # Documentation
 ```
 
-## Key Components
+## How It Works
 
-### 1. Governance API Server (`src/server/`)
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Other Repositories                          │
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │   Repo A     │  │   Repo B     │  │   Repo C     │          │
+│  │  (any app)   │  │  (any app)   │  │  (any app)   │          │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
+│         │                 │                 │                   │
+│         └────────────────┬┴─────────────────┘                   │
+│                          │                                      │
+│                          ▼                                      │
+│  ┌───────────────────────────────────────────────────────────┐ │
+│  │              Governance SDK Server                         │ │
+│  │         (this repo, deployed on Azure)                     │ │
+│  │                                                            │ │
+│  │  POST /api/governance/analyze-pr                           │ │
+│  │  POST /api/governance/security-scan                        │ │
+│  │  POST /api/governance/deployment-decision                  │ │
+│  │                                                            │ │
+│  │  ┌──────────────────────────────────────────────────────┐ │ │
+│  │  │           GitHub Copilot SDK                          │ │ │
+│  │  │     (AI-powered analysis and decisions)               │ │ │
+│  │  └──────────────────────────────────────────────────────┘ │ │
+│  └───────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-Express server that exposes REST endpoints powered by Copilot SDK:
+## API Endpoints
 
-- `POST /api/governance/chat` - Interactive governance chat
-- `POST /api/governance/analyze-pr` - Analyze a pull request
-- `POST /api/governance/security-scan` - Security vulnerability scanning
-- `POST /api/governance/deployment-decision` - Deployment approval decisions
-- `GET /health` - Health check
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/governance/chat` | POST | Interactive governance chat |
+| `/api/governance/analyze-pr` | POST | Analyze a pull request |
+| `/api/governance/security-scan` | POST | Security vulnerability scanning |
+| `/api/governance/deployment-decision` | POST | Deployment approval decisions |
+| `/health` | GET | Health check |
 
-### 2. MCP Server (`src/mcp/`)
+## MCP Tools (for Copilot Chat)
 
-Model Context Protocol server that exposes tools for AI assistants:
+The MCP server exposes these tools:
 
 - `analyze_pull_request` - Comprehensive PR analysis
 - `check_security_vulnerabilities` - Security scanning
 - `evaluate_deployment_readiness` - Deployment checklist
-- `get_infrastructure_changes` - IaC change detection
-- `generate_governance_report` - Markdown report generation
 - `check_policy_compliance` - Policy validation
 
-### 3. Legacy Agents (`src/agents/`)
+## Development
 
-Rule-based agents for GitHub Actions integration:
+```bash
+# Install dependencies
+npm ci
 
-- **iac-agent**: Detects infrastructure changes via git diff
-- **cicd-agent**: Analyzes test results
-- **security-agent**: Runs npm audit
-- **observer-agent**: Evaluates intents against policies
+# Run locally
+npm run dev
 
-## Development Guidelines
+# Run tests
+npm test
 
-### When modifying API endpoints:
-1. Update the tool definitions in `src/server/tools.ts`
-2. Ensure OpenTelemetry spans are properly created
-3. Add error handling that doesn't expose internal details
-4. Update the corresponding MCP tool if applicable
+# Run lint
+npm run lint
 
-### When adding new governance rules:
-1. Add rules to `policies/agent-policies.yaml`
-2. Update the `check_policy_compliance` tool handler
-3. Document the rule in this file
+# Start MCP server
+npm run mcp:start
+```
 
-### When modifying prompts:
-1. Edit `src/server/prompts.ts`
-2. Keep prompts focused on governance decisions
-3. Maintain the risk level and recommendation framework
+## Deployment
+
+The server is deployed to Azure Container Apps:
+
+- **Staging**: `https://ca-governance-staging.azurecontainerapps.io`
+- **Production**: `https://ca-governance-prod.azurecontainerapps.io`
+
+```bash
+# Build Docker image
+docker build -t governance-sdk .
+
+# Run locally
+docker run -p 3000:3000 -e GITHUB_TOKEN=$GITHUB_TOKEN governance-sdk
+```
+
+## Integrating with Other Repositories
+
+See the [examples/](./examples) folder for:
+
+1. **GitHub Actions workflow** - Call the API from your CI
+2. **Webhook handler** - Automate PR analysis via webhooks
+
+Quick example for your repo's workflow:
+
+```yaml
+- name: Governance Check
+  run: |
+    curl -X POST \
+      -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+      -d '{"owner":"${{ github.repository_owner }}","repo":"${{ github.event.repository.name }}","prNumber":${{ github.event.pull_request.number }}}' \
+      https://ca-governance-prod.azurecontainerapps.io/api/governance/analyze-pr
+```
 
 ## Environment Variables
 
@@ -91,43 +139,6 @@ Rule-based agents for GitHub Actions integration:
 | `PORT` | No | Server port (default: 3000) |
 | `NODE_ENV` | No | Environment (development/production) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OpenTelemetry collector endpoint |
-
-## Testing
-
-```bash
-# Run unit tests
-npm test
-
-# Run linting
-npm run lint
-
-# Test locally
-npm run dev
-curl http://localhost:3000/health
-
-# Run MCP server
-npm run mcp:start
-```
-
-## Deployment
-
-The application is designed for Azure Container Apps deployment:
-
-```bash
-# Build and deploy
-azd up
-
-# Or with Docker
-docker build -t enterprise-cicd-agents .
-docker run -p 3000:3000 -e GITHUB_TOKEN=$GITHUB_TOKEN enterprise-cicd-agents
-```
-
-## Security Considerations
-
-1. **Token Handling**: GITHUB_TOKEN should be stored in Azure Key Vault or GitHub Secrets
-2. **No Secrets in Code**: Never commit tokens or credentials
-3. **Audit Logging**: All governance decisions are traced via OpenTelemetry
-4. **Rate Limiting**: Consider adding rate limiting for production
 
 ## AI Behavior Guidelines
 
@@ -139,27 +150,19 @@ The governance AI follows these principles:
 4. **Production Protection**: Production changes always require extra scrutiny
 5. **Transparent Reasoning**: Always explain why a decision was made
 
-## Copilot SDK Integration
+## Development Guidelines
 
-This project uses `@github/copilot-sdk` for AI capabilities:
+### When modifying API endpoints:
+1. Update tool definitions in `src/server/tools.ts`
+2. Ensure OpenTelemetry spans are properly created
+3. Add error handling that doesn't expose internal details
+4. Update the corresponding MCP tool if applicable
 
-```typescript
-import { CopilotClient } from '@github/copilot-sdk';
+### When adding new governance rules:
+1. Add rules to `policies/agent-policies.yaml`
+2. Update the `check_policy_compliance` tool handler
 
-const client = new CopilotClient({ token: GITHUB_TOKEN });
-const session = await client.createSession({
-  systemPrompt: governancePrompt,
-  tools: governanceTools
-});
-const response = await session.sendAndWait(message);
-```
-
-## MCP Integration
-
-Run the MCP server to expose tools to AI assistants:
-
-```bash
-npm run mcp:start
-```
-
-Configure in your AI assistant's MCP settings using `mcp.json`.
+### When modifying prompts:
+1. Edit `src/server/prompts.ts`
+2. Keep prompts focused on governance decisions
+3. Maintain the risk level and recommendation framework

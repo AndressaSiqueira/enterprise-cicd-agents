@@ -30,14 +30,11 @@ npm run build
 # Run tests
 npm test
 
-# Run all agents locally
-npm run agents:run
-
-# Run observer to evaluate intents
-npm run observer:run
-
 # Simulate full CI locally
 npm run ci:local
+
+# Start the governance server
+npm run dev
 ```
 
 ## GitHub Environment Configuration
