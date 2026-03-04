@@ -1,0 +1,86 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/mcp.schema.json",
+  "name": "enterprise-cicd-governance",
+  "version": "1.0.0",
+  "description": "Enterprise CI/CD Governance MCP Server - AI-powered PR analysis, security scanning, and deployment decisions using GitHub Copilot SDK",
+  "author": "Enterprise DevOps Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AndressaSiqueira/enterprise-cicd-agents"
+  },
+  "servers": {
+    "governance": {
+      "command": "npx",
+      "args": ["tsx", "src/mcp/server.ts"],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      },
+      "description": "Enterprise CI/CD Governance Server providing AI-powered governance tools"
+    }
+  },
+  "tools": [
+    {
+      "name": "analyze_pull_request",
+      "description": "Analyze a GitHub pull request for governance decisions. Returns risk assessment, policy compliance, and recommended actions based on file changes, approvals, and enterprise policies."
+    },
+    {
+      "name": "check_security_vulnerabilities",
+      "description": "Check for security vulnerabilities using npm audit and GitHub security features. Returns vulnerability counts, risk levels, and recommendations."
+    },
+    {
+      "name": "evaluate_deployment_readiness",
+      "description": "Evaluate if a deployment is ready to proceed. Checks CI status, required approvals, and generates environment-specific checklists."
+    },
+    {
+      "name": "get_infrastructure_changes",
+      "description": "Detect infrastructure-as-code changes (Terraform, Bicep, YAML) between branches. Identifies production vs non-production changes."
+    },
+    {
+      "name": "generate_governance_report",
+      "description": "Generate a comprehensive Markdown governance report for a PR or repository, suitable for posting as a PR comment."
+    },
+    {
+      "name": "check_policy_compliance",
+      "description": "Validate changes against enterprise governance policies. Returns required approvals, security review requirements, and compliance status."
+    }
+  ],
+  "prompts": [
+    {
+      "name": "governance_analysis",
+      "description": "Analyze a PR or deployment for governance compliance",
+      "template": "Analyze PR #{{prNumber}} in {{owner}}/{{repo}} for governance compliance. Consider security risks, infrastructure changes, and policy requirements."
+    },
+    {
+      "name": "deployment_decision",
+      "description": "Make a deployment decision for an environment",
+      "template": "Evaluate deployment to {{environment}} for {{owner}}/{{repo}}. Should this deployment proceed? What checks are required?"
+    },
+    {
+      "name": "security_review",
+      "description": "Perform a security review of the repository",
+      "template": "Perform a security review of {{owner}}/{{repo}}. Check for vulnerabilities, security misconfigurations, and provide recommendations."
+    }
+  ],
+  "resources": [
+    {
+      "name": "policies",
+      "description": "Enterprise governance policies",
+      "uri": "file://policies/agent-policies.yaml"
+    }
+  ],
+  "capabilities": {
+    "tools": true,
+    "prompts": true,
+    "resources": true
+  },
+  "requirements": {
+    "node": ">=20.0.0",
+    "environment": {
+      "GITHUB_TOKEN": {
+        "description": "GitHub Personal Access Token with repo scope",
+        "required": true
+      }
+    }
+  }
+}
