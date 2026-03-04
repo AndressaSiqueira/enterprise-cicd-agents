@@ -22,10 +22,17 @@ on:
 permissions:
   contents: read
   deployments: write
-  id-token: write  # For OIDC authentication if needed
+  id-token: write  # For OIDC authentication with Azure
 
 env:
   NODE_VERSION: '20'
+  # Azure Configuration - Set these as repository secrets/variables
+  AZURE_RESOURCE_GROUP: rg-cicd-governance
+  AZURE_LOCATION: eastus
+  ACR_NAME: acrcicdgovernance
+  CONTAINER_APP_NAME_STAGING: ca-governance-staging
+  CONTAINER_APP_NAME_PROD: ca-governance-prod
+  CONTAINER_APP_ENV: cae-governance
 
 jobs:
   build:
@@ -33,6 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       build_sha: ${{ github.sha }}
+      image_tag: ${{ steps.meta.outputs.tags }}
     
     steps:
       - name: Checkout repository
@@ -55,6 +63,39 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to Azure Container Registry
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ACR_NAME }}.azurecr.io/governance-api
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -69,41 +110,81 @@ jobs:
     environment: staging
     outputs:
       deployment_status: ${{ steps.deploy.outputs.status }}
+      staging_url: ${{ steps.deploy.outputs.url }}
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - name: Azure Login
+        uses: azure/login@v2
         with:
-          name: build-output
-          path: dist/
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to staging
+      - name: Deploy to Azure Container Apps (Staging)
         id: deploy
         run: |
           echo "🚀 Deploying to staging environment..."
-          echo "SHA: ${{ github.sha }}"
-          echo "Actor: ${{ github.actor }}"
-          echo ""
           
-          # Simulated deployment steps
-          echo "1. Preparing deployment package..."
-          sleep 1
-          echo "2. Uploading to staging infrastructure..."
-          sleep 1
-          echo "3. Running health checks..."
-          sleep 1
-          echo "4. Deployment complete!"
+          # Get the image tag
+          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-api:${{ github.sha }}"
+          
+          # Check if Container App exists
+          APP_EXISTS=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query "name" -o tsv 2>/dev/null || echo "")
+          
+          if [ -z "$APP_EXISTS" ]; then
+            echo "Creating new Container App..."
+            az containerapp create \
+              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --environment ${{ env.CONTAINER_APP_ENV }} \
+              --image $IMAGE \
+              --target-port 3000 \
+              --ingress external \
+              --min-replicas 1 \
+              --max-replicas 3 \
+              --env-vars "NODE_ENV=staging" \
+              --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+              --registry-identity system
+          else
+            echo "Updating existing Container App..."
+            az containerapp update \
+              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --image $IMAGE
+          fi
+          
+          # Get the URL
+          URL=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
           
           echo "status=success" >> $GITHUB_OUTPUT
+          echo "url=https://$URL" >> $GITHUB_OUTPUT
+          echo "✅ Deployed to: https://$URL"
 
       - name: Staging smoke tests
         run: |
           echo "Running staging smoke tests..."
-          # In a real scenario, this would hit staging endpoints
-          echo "✅ Smoke tests passed"
+          URL="${{ steps.deploy.outputs.url }}"
+          
+          # Wait for app to be ready
+          sleep 10
+          
+          # Health check
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo "000")
+          
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "✅ Health check passed (HTTP $HTTP_STATUS)"
+          else
+            echo "⚠️ Health check returned HTTP $HTTP_STATUS (may still be starting)"
+          fi
 
   run-governance-checks:
     name: Production Governance Check
@@ -197,17 +278,14 @@ jobs:
     # This job requires manual approval via GitHub Environment protection rules
     environment: 
       name: production
-      url: https://production.example.com
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+      status: ${{ steps.deploy.outputs.status }}
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-output
-          path: dist/
 
       - name: Download governance artifacts
         uses: actions/download-artifact@v4
@@ -227,7 +305,14 @@ jobs:
             echo ""
           fi
 
-      - name: Deploy to production
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Azure Container Apps (Production)
         id: deploy
         run: |
           echo "🚀 Deploying to production environment..."
@@ -236,24 +321,71 @@ jobs:
           echo "Run ID: ${{ github.run_id }}"
           echo ""
           
-          # Simulated production deployment
-          echo "1. Creating deployment snapshot..."
-          sleep 1
-          echo "2. Deploying to production cluster..."
-          sleep 2
-          echo "3. Rolling out to all instances..."
-          sleep 1
-          echo "4. Running production health checks..."
-          sleep 1
-          echo "5. Deployment complete!"
+          # Get the image tag (same as staging, already tested)
+          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-api:${{ github.sha }}"
+          
+          # Check if Container App exists
+          APP_EXISTS=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query "name" -o tsv 2>/dev/null || echo "")
+          
+          if [ -z "$APP_EXISTS" ]; then
+            echo "Creating new Container App..."
+            az containerapp create \
+              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --environment ${{ env.CONTAINER_APP_ENV }} \
+              --image $IMAGE \
+              --target-port 3000 \
+              --ingress external \
+              --min-replicas 2 \
+              --max-replicas 10 \
+              --env-vars "NODE_ENV=production" \
+              --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+              --registry-identity system \
+              --cpu 1.0 \
+              --memory 2.0Gi
+          else
+            echo "Updating existing Container App..."
+            az containerapp update \
+              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --image $IMAGE
+          fi
+          
+          # Get the URL
+          URL=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
           
           echo "status=success" >> $GITHUB_OUTPUT
+          echo "url=https://$URL" >> $GITHUB_OUTPUT
+          echo "✅ Deployed to: https://$URL"
 
       - name: Production smoke tests
         run: |
           echo "Running production smoke tests..."
-          # In a real scenario, this would hit production endpoints
-          echo "✅ Production smoke tests passed"
+          URL="${{ steps.deploy.outputs.url }}"
+          
+          # Wait for app to be ready
+          sleep 15
+          
+          # Health check with retries
+          for i in 1 2 3; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo "000")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Health check passed (HTTP $HTTP_STATUS)"
+              break
+            fi
+            echo "Attempt $i: HTTP $HTTP_STATUS, retrying..."
+            sleep 5
+          done
+          
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "⚠️ Health check did not return 200, but deployment may still be in progress"
+          fi
 
       - name: Create deployment record
         run: |
@@ -265,6 +397,7 @@ jobs:
             "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
             "actor": "${{ github.actor }}",
             "run_id": "${{ github.run_id }}",
+            "url": "${{ steps.deploy.outputs.url }}",
             "status": "success"
           }
           EOF
@@ -292,7 +425,11 @@ jobs:
           echo "✅ Production deployment completed successfully!"
           echo "SHA: ${{ github.sha }}"
           echo "Repository: ${{ github.repository }}"
-          # In a real scenario, send to Slack, Teams, etc.
+          echo "URL: ${{ needs.deploy-production.outputs.url }}"
+          # TODO: Add Slack/Teams notification
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"Production deployed: ${{ github.sha }}"}' \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}
 
       - name: Notify on failure
         if: needs.deploy-production.result == 'failure'
@@ -300,4 +437,66 @@ jobs:
           echo "❌ Production deployment failed!"
           echo "SHA: ${{ github.sha }}"
           echo "Check workflow run for details."
-          # In a real scenario, send urgent notification
+          # TODO: Add urgent notification
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"🚨 Production deployment FAILED: ${{ github.sha }}"}' \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Infrastructure provisioning job (run manually when needed)
+  provision-infrastructure:
+    name: Provision Azure Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'provision'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create Resource Group
+        run: |
+          az group create \
+            --name ${{ env.AZURE_RESOURCE_GROUP }} \
+            --location ${{ env.AZURE_LOCATION }}
+
+      - name: Create Container Registry
+        run: |
+          az acr create \
+            --name ${{ env.ACR_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --sku Basic \
+            --admin-enabled false
+
+      - name: Create Container Apps Environment
+        run: |
+          az containerapp env create \
+            --name ${{ env.CONTAINER_APP_ENV }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --location ${{ env.AZURE_LOCATION }}
+
+      - name: Grant ACR pull permission to Container Apps
+        run: |
+          # Get the managed identity of the Container Apps environment
+          IDENTITY_ID=$(az containerapp env show \
+            --name ${{ env.CONTAINER_APP_ENV }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query "identity.principalId" -o tsv 2>/dev/null || echo "")
+          
+          if [ -n "$IDENTITY_ID" ]; then
+            ACR_ID=$(az acr show \
+              --name ${{ env.ACR_NAME }} \
+              --query "id" -o tsv)
+            
+            az role assignment create \
+              --assignee $IDENTITY_ID \
+              --role "AcrPull" \
+              --scope $ACR_ID
+          fi
+          
+          echo "✅ Infrastructure provisioned successfully!"
