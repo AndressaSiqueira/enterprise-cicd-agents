@@ -16,7 +16,7 @@ on:
       skip_agents:
         description: 'Skip agent evaluation (for emergencies only)'
         required: false
-        default: 'false'
+        default: false
         type: boolean
 
 permissions:
@@ -285,6 +285,14 @@ jobs:
             echo "⏳ Waiting for role assignment to propagate (30s)..."
             sleep 30
             
+            # Configure registry with managed identity FIRST (before pulling image)
+            echo "📦 Configuring ACR registry with managed identity..."
+            az containerapp registry set \
+              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --server "${{ env.ACR_NAME }}.azurecr.io" \
+              --identity system
+            
             # Now update with the actual image from ACR
             echo "📦 Updating Container App with application image..."
             az containerapp update \
@@ -292,13 +300,6 @@ jobs:
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --image "$IMAGE" \
               --set-env-vars "NODE_ENV=staging" "BUILD_SHA=${{ github.sha }}"
-              
-            # Configure registry with managed identity
-            az containerapp registry set \
-              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --server "${{ env.ACR_NAME }}.azurecr.io" \
-              --identity system
           else
             echo "📦 Updating existing Container App..."
             
@@ -586,19 +587,20 @@ jobs:
               echo "✅ AcrPull role already exists"
             fi
             
+            # Configure registry with managed identity FIRST (before pulling image)
+            echo "📦 Configuring ACR registry with managed identity..."
+            az containerapp registry set \
+              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --server ${{ env.ACR_NAME }}.azurecr.io \
+              --identity system
+            
             # Now update with the actual image from ACR
             echo "Updating Container App with actual image..."
             az containerapp update \
               --name ${{ env.CONTAINER_APP_NAME_PROD }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --image $IMAGE
-            
-            # Configure registry with managed identity  
-            az containerapp registry set \
-              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --server ${{ env.ACR_NAME }}.azurecr.io \
-              --identity system
           else
             echo "Updating existing Container App..."
             
