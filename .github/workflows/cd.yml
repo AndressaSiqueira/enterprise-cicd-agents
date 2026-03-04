@@ -35,9 +35,80 @@ env:
   CONTAINER_APP_ENV: cae-governance
 
 jobs:
+  # ============================================
+  # STEP 1: Provision Infrastructure (if needed)
+  # ============================================
+  provision-infrastructure:
+    name: Provision Azure Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      acr_login_server: ${{ steps.provision.outputs.acr_login_server }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision Infrastructure
+        id: provision
+        run: |
+          echo "🔧 Checking and provisioning Azure infrastructure..."
+          
+          # Check/Create Resource Group
+          RG_EXISTS=$(az group exists --name ${{ env.AZURE_RESOURCE_GROUP }})
+          if [ "$RG_EXISTS" = "false" ]; then
+            echo "Creating Resource Group..."
+            az group create \
+              --name ${{ env.AZURE_RESOURCE_GROUP }} \
+              --location ${{ env.AZURE_LOCATION }}
+          else
+            echo "✅ Resource Group exists"
+          fi
+          
+          # Check/Create Container Registry
+          ACR_EXISTS=$(az acr show --name ${{ env.ACR_NAME }} --query "name" -o tsv 2>/dev/null || echo "")
+          if [ -z "$ACR_EXISTS" ]; then
+            echo "Creating Container Registry..."
+            az acr create \
+              --name ${{ env.ACR_NAME }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --sku Basic \
+              --admin-enabled false
+          else
+            echo "✅ Container Registry exists"
+          fi
+          
+          # Get ACR login server
+          ACR_LOGIN_SERVER=$(az acr show --name ${{ env.ACR_NAME }} --query "loginServer" -o tsv)
+          echo "acr_login_server=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
+          
+          # Check/Create Container Apps Environment
+          CAE_EXISTS=$(az containerapp env show --name ${{ env.CONTAINER_APP_ENV }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --query "name" -o tsv 2>/dev/null || echo "")
+          if [ -z "$CAE_EXISTS" ]; then
+            echo "Creating Container Apps Environment..."
+            az containerapp env create \
+              --name ${{ env.CONTAINER_APP_ENV }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --location ${{ env.AZURE_LOCATION }}
+          else
+            echo "✅ Container Apps Environment exists"
+          fi
+          
+          echo "✅ Infrastructure ready!"
+
+  # ============================================
+  # STEP 2: Build Application
+  # ============================================
   build:
     name: Build Application
     runs-on: ubuntu-latest
+    needs: provision-infrastructure
     outputs:
       build_sha: ${{ github.sha }}
       image_tag: ${{ steps.meta.outputs.tags }}
@@ -426,10 +497,6 @@ jobs:
           echo "SHA: ${{ github.sha }}"
           echo "Repository: ${{ github.repository }}"
           echo "URL: ${{ needs.deploy-production.outputs.url }}"
-          # TODO: Add Slack/Teams notification
-          # curl -X POST -H 'Content-type: application/json' \
-          #   --data '{"text":"Production deployed: ${{ github.sha }}"}' \
-          #   ${{ secrets.SLACK_WEBHOOK_URL }}
 
       - name: Notify on failure
         if: needs.deploy-production.result == 'failure'
@@ -437,66 +504,3 @@ jobs:
           echo "❌ Production deployment failed!"
           echo "SHA: ${{ github.sha }}"
           echo "Check workflow run for details."
-          # TODO: Add urgent notification
-          # curl -X POST -H 'Content-type: application/json' \
-          #   --data '{"text":"🚨 Production deployment FAILED: ${{ github.sha }}"}' \
-          #   ${{ secrets.SLACK_WEBHOOK_URL }}
-
-  # Infrastructure provisioning job (run manually when needed)
-  provision-infrastructure:
-    name: Provision Azure Infrastructure
-    runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'provision'
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Create Resource Group
-        run: |
-          az group create \
-            --name ${{ env.AZURE_RESOURCE_GROUP }} \
-            --location ${{ env.AZURE_LOCATION }}
-
-      - name: Create Container Registry
-        run: |
-          az acr create \
-            --name ${{ env.ACR_NAME }} \
-            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --sku Basic \
-            --admin-enabled false
-
-      - name: Create Container Apps Environment
-        run: |
-          az containerapp env create \
-            --name ${{ env.CONTAINER_APP_ENV }} \
-            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --location ${{ env.AZURE_LOCATION }}
-
-      - name: Grant ACR pull permission to Container Apps
-        run: |
-          # Get the managed identity of the Container Apps environment
-          IDENTITY_ID=$(az containerapp env show \
-            --name ${{ env.CONTAINER_APP_ENV }} \
-            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-            --query "identity.principalId" -o tsv 2>/dev/null || echo "")
-          
-          if [ -n "$IDENTITY_ID" ]; then
-            ACR_ID=$(az acr show \
-              --name ${{ env.ACR_NAME }} \
-              --query "id" -o tsv)
-            
-            az role assignment create \
-              --assignee $IDENTITY_ID \
-              --role "AcrPull" \
-              --scope $ACR_ID
-          fi
-          
-          echo "✅ Infrastructure provisioned successfully!"
