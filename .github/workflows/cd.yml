@@ -60,10 +60,12 @@ jobs:
         run: |
           echo "🔧 Checking and provisioning Azure infrastructure..."
           
-          # Check/Create Resource Group
+          # ============================================
+          # 1. Resource Group
+          # ============================================
           RG_EXISTS=$(az group exists --name ${{ env.AZURE_RESOURCE_GROUP }})
           if [ "$RG_EXISTS" = "false" ]; then
-            echo "Creating Resource Group..."
+            echo "📦 Creating Resource Group..."
             az group create \
               --name ${{ env.AZURE_RESOURCE_GROUP }} \
               --location ${{ env.AZURE_LOCATION }}
@@ -71,10 +73,12 @@ jobs:
             echo "✅ Resource Group exists"
           fi
           
-          # Check/Create Container Registry
+          # ============================================
+          # 2. Container Registry
+          # ============================================
           ACR_EXISTS=$(az acr show --name ${{ env.ACR_NAME }} --query "name" -o tsv 2>/dev/null || echo "")
           if [ -z "$ACR_EXISTS" ]; then
-            echo "Creating Container Registry..."
+            echo "📦 Creating Container Registry..."
             az acr create \
               --name ${{ env.ACR_NAME }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -84,14 +88,42 @@ jobs:
             echo "✅ Container Registry exists"
           fi
           
-          # Get ACR login server
+          # Get ACR login server and ID
           ACR_LOGIN_SERVER=$(az acr show --name ${{ env.ACR_NAME }} --query "loginServer" -o tsv)
+          ACR_ID=$(az acr show --name ${{ env.ACR_NAME }} --query "id" -o tsv)
           echo "acr_login_server=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
+          echo "acr_id=$ACR_ID" >> $GITHUB_OUTPUT
           
-          # Check/Create Container Apps Environment
+          # ============================================
+          # 3. Grant AcrPush to Pipeline Service Principal
+          # This allows the CD pipeline to push images to ACR
+          # ============================================
+          echo "🔐 Ensuring AcrPush permission for pipeline..."
+          SP_APP_ID="${{ secrets.AZURE_CLIENT_ID }}"
+          
+          # Check if assignment exists
+          ACRPUSH_EXISTS=$(az role assignment list \
+            --assignee "$SP_APP_ID" \
+            --role "AcrPush" \
+            --scope "$ACR_ID" \
+            --query "[0].id" -o tsv 2>/dev/null || echo "")
+          
+          if [ -z "$ACRPUSH_EXISTS" ]; then
+            echo "📦 Granting AcrPush to pipeline Service Principal..."
+            az role assignment create \
+              --assignee "$SP_APP_ID" \
+              --role "AcrPush" \
+              --scope "$ACR_ID" || echo "⚠️ AcrPush assignment may already exist or require propagation"
+          else
+            echo "✅ AcrPush permission exists"
+          fi
+          
+          # ============================================
+          # 4. Container Apps Environment
+          # ============================================
           CAE_EXISTS=$(az containerapp env show --name ${{ env.CONTAINER_APP_ENV }} --resource-group ${{ env.AZURE_RESOURCE_GROUP }} --query "name" -o tsv 2>/dev/null || echo "")
           if [ -z "$CAE_EXISTS" ]; then
-            echo "Creating Container Apps Environment..."
+            echo "📦 Creating Container Apps Environment..."
             az containerapp env create \
               --name ${{ env.CONTAINER_APP_ENV }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -100,7 +132,10 @@ jobs:
             echo "✅ Container Apps Environment exists"
           fi
           
-          echo "✅ Infrastructure ready!"
+          echo ""
+          echo "✅ Infrastructure provisioning complete!"
+          echo "   ACR: $ACR_LOGIN_SERVER"
+          echo "   Environment: ${{ env.CONTAINER_APP_ENV }}"
 
   # ============================================
   # STEP 2: Build Application
@@ -199,8 +234,12 @@ jobs:
         run: |
           echo "🚀 Deploying to staging environment..."
           
-          # Get the image tag
-          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-api:${{ github.sha }}"
+          # Use short SHA for image tag (matches docker/metadata-action output)
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-api:${SHORT_SHA}"
+          
+          # Get ACR resource ID for role assignments
+          ACR_ID=$(az acr show --name ${{ env.ACR_NAME }} --query "id" -o tsv)
           
           # Check if Container App exists
           APP_EXISTS=$(az containerapp show \
@@ -209,25 +248,64 @@ jobs:
             --query "name" -o tsv 2>/dev/null || echo "")
           
           if [ -z "$APP_EXISTS" ]; then
-            echo "Creating new Container App..."
+            echo "📦 Creating new Container App with system-assigned managed identity..."
+            
+            # Create Container App with a placeholder image first to get managed identity
+            # Using mcr.microsoft.com/k8se/quickstart as it's always available
             az containerapp create \
               --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --environment ${{ env.CONTAINER_APP_ENV }} \
-              --image $IMAGE \
+              --image "mcr.microsoft.com/k8se/quickstart:latest" \
               --target-port 3000 \
               --ingress external \
               --min-replicas 1 \
               --max-replicas 3 \
-              --env-vars "NODE_ENV=staging" \
-              --registry-server ${{ env.ACR_NAME }}.azurecr.io \
-              --registry-identity system
-          else
-            echo "Updating existing Container App..."
+              --system-assigned \
+              --env-vars "NODE_ENV=staging"
+            
+            # Get the managed identity principal ID
+            echo "🔐 Configuring ACR access for Container App managed identity..."
+            IDENTITY_PRINCIPAL_ID=$(az containerapp show \
+              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --query "identity.principalId" -o tsv)
+            
+            echo "   Identity Principal ID: $IDENTITY_PRINCIPAL_ID"
+            
+            # Grant AcrPull role to the Container App's managed identity
+            echo "📦 Granting AcrPull permission..."
+            az role assignment create \
+              --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
+              --assignee-principal-type "ServicePrincipal" \
+              --role "AcrPull" \
+              --scope "$ACR_ID"
+            
+            # Wait for role assignment to propagate
+            echo "⏳ Waiting for role assignment to propagate (30s)..."
+            sleep 30
+            
+            # Now update with the actual image from ACR
+            echo "📦 Updating Container App with application image..."
             az containerapp update \
               --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-              --image $IMAGE
+              --image "$IMAGE" \
+              --set-env-vars "NODE_ENV=staging" "BUILD_SHA=${{ github.sha }}"
+              
+            # Configure registry with managed identity
+            az containerapp registry set \
+              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --server "${{ env.ACR_NAME }}.azurecr.io" \
+              --identity system
+          else
+            echo "📦 Updating existing Container App..."
+            az containerapp update \
+              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --image "$IMAGE" \
+              --set-env-vars "BUILD_SHA=${{ github.sha }}"
           fi
           
           # Get the URL
@@ -238,6 +316,7 @@ jobs:
           
           echo "status=success" >> $GITHUB_OUTPUT
           echo "url=https://$URL" >> $GITHUB_OUTPUT
+          echo ""
           echo "✅ Deployed to: https://$URL"
 
       - name: Staging smoke tests
@@ -393,7 +472,14 @@ jobs:
           echo ""
           
           # Get the image tag (same as staging, already tested)
-          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-api:${{ github.sha }}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="${{ env.ACR_NAME }}.azurecr.io/governance-api:${SHORT_SHA}"
+          
+          # Get ACR ID for role assignment
+          ACR_ID=$(az acr show \
+            --name ${{ env.ACR_NAME }} \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --query "id" -o tsv)
           
           # Check if Container App exists
           APP_EXISTS=$(az containerapp show \
@@ -402,21 +488,66 @@ jobs:
             --query "name" -o tsv 2>/dev/null || echo "")
           
           if [ -z "$APP_EXISTS" ]; then
-            echo "Creating new Container App..."
+            echo "Creating new Container App with placeholder image..."
+            # Create with placeholder first to get managed identity
             az containerapp create \
               --name ${{ env.CONTAINER_APP_NAME_PROD }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
               --environment ${{ env.CONTAINER_APP_ENV }} \
-              --image $IMAGE \
+              --image "mcr.microsoft.com/k8se/quickstart:latest" \
               --target-port 3000 \
               --ingress external \
               --min-replicas 2 \
               --max-replicas 10 \
               --env-vars "NODE_ENV=production" \
-              --registry-server ${{ env.ACR_NAME }}.azurecr.io \
-              --registry-identity system \
               --cpu 1.0 \
-              --memory 2.0Gi
+              --memory 2.0Gi \
+              --system-assigned
+            
+            # Get the managed identity principal ID
+            echo "Getting managed identity principal ID..."
+            IDENTITY_PRINCIPAL_ID=$(az containerapp show \
+              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --query "identity.principalId" -o tsv)
+            echo "Managed Identity Principal ID: $IDENTITY_PRINCIPAL_ID"
+            
+            # Grant AcrPull role to the managed identity
+            echo "Granting AcrPull role to managed identity..."
+            EXISTING_ROLE=$(az role assignment list \
+              --assignee "$IDENTITY_PRINCIPAL_ID" \
+              --role "AcrPull" \
+              --scope "$ACR_ID" \
+              --query "[0].id" -o tsv 2>/dev/null || echo "")
+            
+            if [ -z "$EXISTING_ROLE" ]; then
+              az role assignment create \
+                --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
+                --assignee-principal-type ServicePrincipal \
+                --role "AcrPull" \
+                --scope "$ACR_ID"
+              echo "✅ AcrPull role granted to managed identity"
+              
+              # Wait for role propagation
+              echo "Waiting 30 seconds for role propagation..."
+              sleep 30
+            else
+              echo "✅ AcrPull role already exists"
+            fi
+            
+            # Now update with the actual image from ACR
+            echo "Updating Container App with actual image..."
+            az containerapp update \
+              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --image $IMAGE
+            
+            # Configure registry with managed identity  
+            az containerapp registry set \
+              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --server ${{ env.ACR_NAME }}.azurecr.io \
+              --identity system
           else
             echo "Updating existing Container App..."
             az containerapp update \
