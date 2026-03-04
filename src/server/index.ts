@@ -8,11 +8,10 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { CopilotClient, approveAll } from '@github/copilot-sdk';
 import { Octokit } from '@octokit/rest';
-import { trace, SpanStatusCode } from '@opentelemetry/api';
+import { trace } from '@opentelemetry/api';
 import { initTelemetry } from '../shared/telemetry.js';
 import { governanceTools } from './tools.js';
 import { systemPrompt } from './prompts.js';
-import { DependencyService } from '../integrations/dependency-service.js';
 
 // Initialize telemetry
 initTelemetry('governance-api');
@@ -23,10 +22,10 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
-// Initialize clients
+// Initialize GitHub client
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-// Shared Copilot client (reusable across requests)
+// Shared Copilot client
 let copilotClient: CopilotClient | null = null;
 
 async function getCopilotClient(): Promise<CopilotClient> {
@@ -40,16 +39,19 @@ async function getCopilotClient(): Promise<CopilotClient> {
   return copilotClient;
 }
 
-// Health check endpoint
+// Health check
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ 
     status: 'healthy', 
     version: '1.0.0',
-    features: ['pr-analysis', 'security-scan', 'deployment-governance']
+    features: ['pr-analysis', 'security-scan', 'deployment-decision']
   });
 });
 
-// Main governance chat endpoint
+/**
+ * POST /api/governance/chat
+ * Interactive governance chat with AI
+ */
 app.post('/api/governance/chat', async (req: Request, res: Response, next: NextFunction) => {
   const tracer = trace.getTracer('governance-api');
   
@@ -59,61 +61,45 @@ app.post('/api/governance/chat', async (req: Request, res: Response, next: NextF
 
       if (!message) {
         res.status(400).json({ error: 'Message is required' });
-        span.setStatus({ code: SpanStatusCode.ERROR, message: 'Missing message' });
         span.end();
         return;
       }
 
       if (!GITHUB_TOKEN) {
         res.status(500).json({ error: 'GITHUB_TOKEN not configured' });
-        span.setStatus({ code: SpanStatusCode.ERROR, message: 'Missing token' });
         span.end();
         return;
       }
 
-      span.setAttribute('message.length', message.length);
-      span.setAttribute('context.repo', context?.repo || 'unknown');
-
-      // Get Copilot client and create session
       const client = await getCopilotClient();
       const session = await client.createSession({
         model: 'gpt-5',
         tools: governanceTools,
-        systemMessage: {
-          content: systemPrompt
-        },
+        systemMessage: { content: systemPrompt },
         onPermissionRequest: approveAll
       });
 
-      // Build context-enriched message
       const enrichedMessage = context 
-        ? `Context: Repository ${context.owner}/${context.repo}, PR #${context.prNumber || 'N/A'}, Branch: ${context.branch || 'unknown'}\n\nUser Request: ${message}`
+        ? `Context: ${context.owner}/${context.repo}, PR #${context.prNumber || 'N/A'}\n\n${message}`
         : message;
 
-      // Get AI response with tool execution
       const response = await session.sendAndWait({ prompt: enrichedMessage });
-
       const content = response?.data?.content || '';
-      span.setAttribute('response.length', content.length);
-      span.setStatus({ code: SpanStatusCode.OK });
 
-      res.json({
-        response: content,
-        sessionId: session.sessionId
-      });
-
+      res.json({ response: content, sessionId: session.sessionId });
       await session.destroy();
       span.end();
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      span.setStatus({ code: SpanStatusCode.ERROR, message: errorMessage });
       span.end();
       next(error);
     }
   });
 });
 
-// PR Analysis endpoint - specialized for CI integration
+/**
+ * POST /api/governance/analyze-pr
+ * Analyze a PR for governance decisions
+ */
 app.post('/api/governance/analyze-pr', async (req: Request, res: Response, next: NextFunction) => {
   const tracer = trace.getTracer('governance-api');
   
@@ -127,107 +113,81 @@ app.post('/api/governance/analyze-pr', async (req: Request, res: Response, next:
         return;
       }
 
-      span.setAttribute('pr.owner', owner);
-      span.setAttribute('pr.repo', repo);
-      span.setAttribute('pr.number', prNumber);
-
       if (!GITHUB_TOKEN) {
         res.status(500).json({ error: 'GITHUB_TOKEN not configured' });
         span.end();
         return;
       }
 
-      // Fetch PR details
+      // Fetch PR details from GitHub
       const { data: pr } = await octokit.pulls.get({ owner, repo, pull_number: prNumber });
       const { data: files } = await octokit.pulls.listFiles({ owner, repo, pull_number: prNumber });
       const { data: checks } = await octokit.checks.listForRef({ owner, repo, ref: pr.head.sha });
 
-      // Categorize changes
+      // Categorize files
       const infraFiles = files.filter(f => 
-        f.filename.includes('infra/') || 
-        f.filename.endsWith('.tf') || 
-        f.filename.endsWith('.bicep')
+        f.filename.includes('infra/') || f.filename.endsWith('.tf') || f.filename.endsWith('.bicep')
       );
       const securityFiles = files.filter(f =>
-        f.filename.includes('security') ||
-        f.filename.includes('.env') ||
-        f.filename.includes('secret')
+        f.filename.includes('security') || f.filename.includes('.env') || f.filename.includes('secret')
       );
       const testFiles = files.filter(f => f.filename.includes('.test.') || f.filename.includes('.spec.'));
 
-      // Create analysis prompt
+      // AI analysis prompt
       const analysisPrompt = `
-Analyze this Pull Request for governance decisions:
+Analyze this Pull Request:
 
-PR: ${pr.title} (#${prNumber})
-Author: ${pr.user?.login}
-Base: ${pr.base.ref} <- Head: ${pr.head.ref}
-Description: ${pr.body || 'No description'}
+**PR:** ${pr.title} (#${prNumber})
+**Author:** ${pr.user?.login}
+**Branch:** ${pr.base.ref} <- ${pr.head.ref}
+**Description:** ${pr.body || 'No description'}
 
-Files Changed (${files.length} total):
-- Infrastructure files: ${infraFiles.length} (${infraFiles.map(f => f.filename).join(', ') || 'none'})
-- Security-related files: ${securityFiles.length} (${securityFiles.map(f => f.filename).join(', ') || 'none'})
-- Test files: ${testFiles.length}
-- Other files: ${files.length - infraFiles.length - securityFiles.length - testFiles.length}
+**Files Changed (${files.length} total):**
+- Infrastructure: ${infraFiles.length} files
+- Security-related: ${securityFiles.length} files  
+- Tests: ${testFiles.length} files
 
-CI Status: ${checks.check_runs.length} checks, ${checks.check_runs.filter(c => c.conclusion === 'success').length} passed
+**CI Status:** ${checks.check_runs.filter(c => c.conclusion === 'success').length}/${checks.check_runs.length} passed
 
 Provide:
 1. Risk assessment (low/medium/high/critical)
-2. Governance recommendation (approve/review/block)
+2. Recommendation (approve/review/block)
 3. Required actions before merge
-4. Security concerns if any
 `;
 
-      // Get AI analysis
       const client = await getCopilotClient();
       const session = await client.createSession({
         model: 'gpt-5',
         tools: governanceTools,
-        systemMessage: {
-          content: systemPrompt
-        },
+        systemMessage: { content: systemPrompt },
         onPermissionRequest: approveAll
       });
 
       const response = await session.sendAndWait({ prompt: analysisPrompt });
       const content = response?.data?.content || '';
 
-      // Determine action based on analysis
       const analysis = {
-        pr: {
-          number: prNumber,
-          title: pr.title,
-          author: pr.user?.login,
-          url: pr.html_url
-        },
-        changes: {
-          total: files.length,
-          infrastructure: infraFiles.length,
-          security: securityFiles.length,
-          tests: testFiles.length
-        },
+        pr: { number: prNumber, title: pr.title, author: pr.user?.login, url: pr.html_url },
+        changes: { total: files.length, infrastructure: infraFiles.length, security: securityFiles.length, tests: testFiles.length },
         aiAnalysis: content,
         recommendation: determineRecommendation(content),
         timestamp: new Date().toISOString()
       };
 
       await session.destroy();
-      span.setAttribute('analysis.recommendation', analysis.recommendation);
-      span.setStatus({ code: SpanStatusCode.OK });
-      span.end();
-
       res.json(analysis);
+      span.end();
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      span.setStatus({ code: SpanStatusCode.ERROR, message: errorMessage });
       span.end();
       next(error);
     }
   });
 });
 
-// Security scan endpoint
+/**
+ * POST /api/governance/security-scan
+ * Security analysis using GitHub security features
+ */
 app.post('/api/governance/security-scan', async (req: Request, res: Response, next: NextFunction) => {
   const tracer = trace.getTracer('governance-api');
   
@@ -247,47 +207,40 @@ app.post('/api/governance/security-scan', async (req: Request, res: Response, ne
         return;
       }
 
-      // Get code scanning alerts if available
-      let securityAlerts: Array<{ rule: { id: string; severity: string }; state: string }> = [];
+      // Get security alerts from GitHub
+      let codeAlerts: Array<{ rule: { id: string; severity: string }; state: string }> = [];
+      let depAlerts: Array<{ security_vulnerability: { severity: string } }> = [];
+
       try {
         const { data } = await octokit.codeScanning.listAlertsForRepo({ owner, repo });
-        securityAlerts = data as typeof securityAlerts;
-      } catch {
-        // Code scanning may not be enabled
-      }
+        codeAlerts = data as typeof codeAlerts;
+      } catch { /* Code scanning may not be enabled */ }
 
-      // Get dependency alerts
-      let dependencyAlerts: Array<{ security_vulnerability: { severity: string } }> = [];
       try {
         const { data } = await octokit.dependabot.listAlertsForRepo({ owner, repo });
-        dependencyAlerts = data as typeof dependencyAlerts;
-      } catch {
-        // Dependabot may not be enabled
-      }
+        depAlerts = data as typeof depAlerts;
+      } catch { /* Dependabot may not be enabled */ }
 
       const scanPrompt = `
-Analyze security posture for ${owner}/${repo}:
+Security analysis for ${owner}/${repo}:
 
-Code Scanning Alerts: ${securityAlerts.length}
-${securityAlerts.slice(0, 5).map(a => `- ${a.rule.id}: ${a.rule.severity} (${a.state})`).join('\n') || 'No alerts or scanning not enabled'}
+**Code Scanning:** ${codeAlerts.length} alerts
+${codeAlerts.slice(0, 5).map(a => `- ${a.rule.id}: ${a.rule.severity}`).join('\n') || 'None'}
 
-Dependency Alerts: ${dependencyAlerts.length}
-${dependencyAlerts.slice(0, 5).map(a => `- Severity: ${a.security_vulnerability.severity}`).join('\n') || 'No alerts or Dependabot not enabled'}
+**Dependencies:** ${depAlerts.length} alerts
+${depAlerts.slice(0, 5).map(a => `- ${a.security_vulnerability.severity}`).join('\n') || 'None'}
 
 Provide:
-1. Overall security risk level
-2. Critical issues to address
-3. Recommended remediation steps
-4. Should deployment be blocked? (yes/no with reason)
+1. Security risk level
+2. Critical issues to fix
+3. Should deployment be blocked?
 `;
 
       const client = await getCopilotClient();
       const session = await client.createSession({
         model: 'gpt-5',
         tools: governanceTools,
-        systemMessage: {
-          content: systemPrompt
-        },
+        systemMessage: { content: systemPrompt },
         onPermissionRequest: approveAll
       });
 
@@ -297,30 +250,26 @@ Provide:
       const result = {
         repository: `${owner}/${repo}`,
         ref: ref || 'default',
-        alerts: {
-          codeScanning: securityAlerts.length,
-          dependencies: dependencyAlerts.length
-        },
+        alerts: { codeScanning: codeAlerts.length, dependencies: depAlerts.length },
         aiAnalysis: content,
         shouldBlock: content.toLowerCase().includes('block'),
         timestamp: new Date().toISOString()
       };
 
       await session.destroy();
-      span.setStatus({ code: SpanStatusCode.OK });
-      span.end();
-
       res.json(result);
+      span.end();
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      span.setStatus({ code: SpanStatusCode.ERROR, message: errorMessage });
       span.end();
       next(error);
     }
   });
 });
 
-// Deployment decision endpoint
+/**
+ * POST /api/governance/deployment-decision
+ * AI-powered deployment approval
+ */
 app.post('/api/governance/deployment-decision', async (req: Request, res: Response, next: NextFunction) => {
   const tracer = trace.getTracer('governance-api');
   
@@ -342,49 +291,35 @@ app.post('/api/governance/deployment-decision', async (req: Request, res: Respon
 
       // Get deployment history
       const { data: deployments } = await octokit.repos.listDeployments({ 
-        owner, 
-        repo, 
-        environment,
-        per_page: 5 
+        owner, repo, environment, per_page: 5 
       });
 
       // Get recent commits
       const { data: commits } = await octokit.repos.listCommits({
-        owner,
-        repo,
-        sha: sha || undefined,
-        per_page: 10
+        owner, repo, sha: sha || undefined, per_page: 10
       });
 
       const decisionPrompt = `
-Evaluate deployment request for ${owner}/${repo}:
+Deployment request for ${owner}/${repo}:
 
-Target Environment: ${environment}
-Commit SHA: ${sha || 'latest'}
-PR Number: ${prNumber || 'N/A'}
+**Environment:** ${environment}
+**Commit:** ${sha || 'latest'}
+**PR:** ${prNumber || 'N/A'}
 
-Recent Deployments to ${environment}: ${deployments.length}
-${deployments.slice(0, 3).map(d => `- ${d.created_at}: ${d.description || 'No description'}`).join('\n') || 'No recent deployments'}
+**Recent Deployments:** ${deployments.length}
+${deployments.slice(0, 3).map(d => `- ${d.created_at}`).join('\n') || 'None'}
 
-Recent Commits:
+**Recent Commits:**
 ${commits.slice(0, 5).map(c => `- ${c.sha.slice(0, 7)}: ${c.commit.message.split('\n')[0]}`).join('\n')}
 
-Based on enterprise deployment policies:
-1. Is this deployment safe for ${environment}?
-2. What pre-deployment checks are recommended?
-3. Should this require manual approval?
-4. Rollback strategy recommendation
-
-Provide a clear APPROVE or DENY decision with justification.
+Should this deployment to ${environment} be APPROVED or DENIED?
 `;
 
       const client = await getCopilotClient();
       const session = await client.createSession({
         model: 'gpt-5',
         tools: governanceTools,
-        systemMessage: {
-          content: systemPrompt
-        },
+        systemMessage: { content: systemPrompt },
         onPermissionRequest: approveAll
       });
 
@@ -402,84 +337,9 @@ Provide a clear APPROVE or DENY decision with justification.
       };
 
       await session.destroy();
-      span.setAttribute('decision.result', decision.decision);
-      span.setStatus({ code: SpanStatusCode.OK });
-      span.end();
-
       res.json(decision);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      span.setStatus({ code: SpanStatusCode.ERROR, message: errorMessage });
       span.end();
-      next(error);
-    }
-  });
-});
-
-// Multi-repo governance check endpoint
-app.post('/api/governance/multi-repo-check', async (req: Request, res: Response, next: NextFunction) => {
-  const tracer = trace.getTracer('governance-api');
-  
-  await tracer.startActiveSpan('multi-repo-check', async (span) => {
-    try {
-      const { owner, repo, action } = req.body;
-
-      if (!owner || !repo || !action) {
-        res.status(400).json({ error: 'owner, repo, and action are required' });
-        span.end();
-        return;
-      }
-
-      if (!['deploy', 'merge', 'release'].includes(action)) {
-        res.status(400).json({ error: 'action must be one of: deploy, merge, release' });
-        span.end();
-        return;
-      }
-
-      if (!GITHUB_TOKEN) {
-        res.status(500).json({ error: 'GITHUB_TOKEN not configured' });
-        span.end();
-        return;
-      }
-
-      span.setAttribute('repo', `${owner}/${repo}`);
-      span.setAttribute('action', action);
-
-      // Initialize dependency service and check multi-repo status
-      const dependencyService = new DependencyService(GITHUB_TOKEN);
-      const checkResult = await dependencyService.checkMultiRepo(owner, repo, action);
-
-      // Generate summary for AI analysis
-      const aiPrompt = dependencyService.generateSummaryForAI(checkResult);
-
-      // Get AI analysis using Copilot SDK
-      const client = await getCopilotClient();
-      const session = await client.createSession({
-        model: 'gpt-5',
-        tools: governanceTools,
-        systemMessage: {
-          content: systemPrompt
-        },
-        onPermissionRequest: approveAll
-      });
-
-      const response = await session.sendAndWait({ prompt: aiPrompt });
-      const aiAnalysis = response?.data?.content || '';
-
-      const result = {
-        ...checkResult,
-        aiAnalysis
-      };
-
-      await session.destroy();
-      span.setAttribute('decision', result.decision);
-      span.setStatus({ code: SpanStatusCode.OK });
-      span.end();
-
-      res.json(result);
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      span.setStatus({ code: SpanStatusCode.ERROR, message: errorMessage });
       span.end();
       next(error);
     }
@@ -495,28 +355,28 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   });
 });
 
-// Helper function
+// Helper
 function determineRecommendation(content: string): 'approve' | 'review' | 'block' {
   const lower = content.toLowerCase();
-  if (lower.includes('block') || lower.includes('critical') || lower.includes('deny')) {
-    return 'block';
-  }
-  if (lower.includes('review') || lower.includes('high risk') || lower.includes('manual')) {
-    return 'review';
-  }
+  if (lower.includes('block') || lower.includes('critical') || lower.includes('deny')) return 'block';
+  if (lower.includes('review') || lower.includes('high risk') || lower.includes('manual')) return 'review';
   return 'approve';
 }
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Enterprise CI/CD Governance API running on port ${PORT}`);
-  console.log(`📊 Endpoints available:`);
-  console.log(`   POST /api/governance/chat - Interactive governance chat`);
-  console.log(`   POST /api/governance/analyze-pr - PR analysis`);
-  console.log(`   POST /api/governance/security-scan - Security scanning`);
-  console.log(`   POST /api/governance/deployment-decision - Deployment approval`);
-  console.log(`   POST /api/governance/multi-repo-check - Multi-repo governance`);
-  console.log(`   GET  /health - Health check`);
+  console.log(`
+🚀 Enterprise CI/CD Governance API
+
+Endpoints:
+  POST /api/governance/analyze-pr         - AI-powered PR analysis
+  POST /api/governance/security-scan      - Security vulnerability check
+  POST /api/governance/deployment-decision - Deployment approval
+  POST /api/governance/chat               - Interactive governance chat
+  GET  /health                            - Health check
+
+Server running on port ${PORT}
+`);
 });
 
 export default app;
