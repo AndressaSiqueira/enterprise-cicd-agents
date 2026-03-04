@@ -301,6 +301,57 @@ jobs:
               --identity system
           else
             echo "📦 Updating existing Container App..."
+            
+            # Ensure managed identity is enabled
+            IDENTITY_PRINCIPAL_ID=$(az containerapp show \
+              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --query "identity.principalId" -o tsv)
+            
+            if [ -z "$IDENTITY_PRINCIPAL_ID" ] || [ "$IDENTITY_PRINCIPAL_ID" = "null" ]; then
+              echo "🔐 Enabling system-assigned managed identity..."
+              az containerapp identity assign \
+                --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                --system-assigned
+              
+              IDENTITY_PRINCIPAL_ID=$(az containerapp show \
+                --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                --query "identity.principalId" -o tsv)
+            fi
+            
+            echo "   Identity Principal ID: $IDENTITY_PRINCIPAL_ID"
+            
+            # Ensure AcrPull role is assigned
+            EXISTING_ROLE=$(az role assignment list \
+              --assignee "$IDENTITY_PRINCIPAL_ID" \
+              --role "AcrPull" \
+              --scope "$ACR_ID" \
+              --query "[0].id" -o tsv 2>/dev/null || echo "")
+            
+            if [ -z "$EXISTING_ROLE" ]; then
+              echo "📦 Granting AcrPull permission..."
+              az role assignment create \
+                --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
+                --assignee-principal-type "ServicePrincipal" \
+                --role "AcrPull" \
+                --scope "$ACR_ID"
+              
+              echo "⏳ Waiting for role assignment to propagate (30s)..."
+              sleep 30
+            else
+              echo "✅ AcrPull permission already exists"
+            fi
+            
+            # Ensure registry is configured with managed identity
+            az containerapp registry set \
+              --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --server "${{ env.ACR_NAME }}.azurecr.io" \
+              --identity system
+            
+            # Now update with the new image
             az containerapp update \
               --name ${{ env.CONTAINER_APP_NAME_STAGING }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
@@ -550,6 +601,57 @@ jobs:
               --identity system
           else
             echo "Updating existing Container App..."
+            
+            # Ensure managed identity is enabled
+            IDENTITY_PRINCIPAL_ID=$(az containerapp show \
+              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --query "identity.principalId" -o tsv)
+            
+            if [ -z "$IDENTITY_PRINCIPAL_ID" ] || [ "$IDENTITY_PRINCIPAL_ID" = "null" ]; then
+              echo "🔐 Enabling system-assigned managed identity..."
+              az containerapp identity assign \
+                --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                --system-assigned
+              
+              IDENTITY_PRINCIPAL_ID=$(az containerapp show \
+                --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                --query "identity.principalId" -o tsv)
+            fi
+            
+            echo "   Identity Principal ID: $IDENTITY_PRINCIPAL_ID"
+            
+            # Ensure AcrPull role is assigned
+            EXISTING_ROLE=$(az role assignment list \
+              --assignee "$IDENTITY_PRINCIPAL_ID" \
+              --role "AcrPull" \
+              --scope "$ACR_ID" \
+              --query "[0].id" -o tsv 2>/dev/null || echo "")
+            
+            if [ -z "$EXISTING_ROLE" ]; then
+              echo "📦 Granting AcrPull permission..."
+              az role assignment create \
+                --assignee-object-id "$IDENTITY_PRINCIPAL_ID" \
+                --assignee-principal-type "ServicePrincipal" \
+                --role "AcrPull" \
+                --scope "$ACR_ID"
+              
+              echo "⏳ Waiting for role assignment to propagate (30s)..."
+              sleep 30
+            else
+              echo "✅ AcrPull permission already exists"
+            fi
+            
+            # Ensure registry is configured with managed identity
+            az containerapp registry set \
+              --name ${{ env.CONTAINER_APP_NAME_PROD }} \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --server ${{ env.ACR_NAME }}.azurecr.io \
+              --identity system
+            
+            # Now update with the new image
             az containerapp update \
               --name ${{ env.CONTAINER_APP_NAME_PROD }} \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
